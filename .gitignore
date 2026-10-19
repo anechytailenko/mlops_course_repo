@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# vitual env
+.venv/
+
+# cache
+.ruff_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# secrets
+.env
+
+# macOS
+.DS_Store
+
+# DVC
+/data/
