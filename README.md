@@ -2,9 +2,20 @@
 
 [![lint](https://github.com/anechytailenko/mlops_course_repo/actions/workflows/lint.yml/badge.svg)](https://github.com/anechytailenko/mlops_course_repo/actions/workflows/lint.yml)
 
-Course project for **KSE MLOps — Introduction to MLOps and ML System Design**: a dynamic news classification system, built over five labs.
+Course project for **KSE MLOps — Introduction to MLOps and ML System Design**: a dynamic news classification system built on The Guardian Open Platform API, developed over five labs.
 
-> The problem statement (five sentences) and the maturity scorecard are added as part of Lab 1.
+## Problem
+
+Newsrooms file every article under a section, and doing it by hand is slow and inconsistent while topics and vocabulary change every week. This system suggests the section of a news article from its full text and from metadata known at publication time, using The Guardian Open Platform API as its data source. It collects new articles daily, validates and versions them, keeps per-author features in a feature store, and trains, registers and serves a classifier. It monitors drift and quality and retrains when performance degrades, instead of relying on a model frozen in a notebook. Success means editors would accept at least 85% of suggestions, and every model can be rebuilt from the repository.
+
+Design document: [`docs/design.md`](docs/design.md).
+
+## Maturity scorecard
+
+| Property | Evidence a reviewer checks | Added in |
+|---|---|---|
+| Repository reproducible from a clean clone | [CI is green](https://github.com/anechytailenko/mlops_course_repo/actions/workflows/lint.yml); `make setup` and `make lint` succeed on a fresh clone | Lab 1 |
+| Design document exists and is current | [`docs/design.md`](docs/design.md) follows the template, every section filled or marked as an assumption | Lab 1 |
 
 ## Quick start
 
