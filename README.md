@@ -6,7 +6,7 @@ Course project for **KSE MLOps — Introduction to MLOps and ML System Design**:
 
 ## Problem
 
-Newsrooms file every article under a section, and doing it by hand is slow and inconsistent while topics and vocabulary change every week. This system suggests the section of a news article from its full text and from metadata known at publication time, using The Guardian Open Platform API as its data source. It collects new articles daily, validates and versions them, keeps per-author features in a feature store, and trains, registers and serves a classifier. It monitors drift and quality and retrains when performance degrades, instead of relying on a model frozen in a notebook. Success means editors would accept at least 85% of suggestions, and every model can be rebuilt from the repository.
+Newsrooms file every article under a section, and doing it by hand is slow and inconsistent while topics and vocabulary change every week. This system suggests one or more sections for a news article (always at least one) from its full text and from metadata known at publication time, using The Guardian Open Platform API as its data source. It collects new articles daily, validates and versions them, keeps per-author features in a feature store, and trains, registers and serves a classifier. It monitors drift and quality and retrains when performance degrades, instead of relying on a model frozen in a notebook. Success means editors would accept at least 85% of suggestions, and every model can be rebuilt from the repository.
 
 Design document: [`docs/design.md`](docs/design.md).
 

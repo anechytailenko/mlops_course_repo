@@ -14,17 +14,17 @@ Statements marked **Assumption:** are decisions taken without confirmed facts. E
 
 ## 1 Overview
 
-Newsrooms file every article under a section (politics, business, sport, culture, …), and doing it by hand is slow and inconsistent, while topics and vocabulary change every week. We build a system that suggests the section of a news article from its text and from metadata known at publication time, using full-text articles from The Guardian Open Platform API as both training data and the live stream. The system collects new articles daily, validates and versions them, keeps per-author and per-office features in a feature store, trains and registers models, serves predictions through an API and a daily batch, and monitors drift so that it retrains when quality degrades. The desired outcome is a reproducible pipeline whose suggestions an editor accepts for at least 85% of articles and which detects its own degradation without waiting for a person to notice.
+Newsrooms file every article under a section (politics, business, sport, culture, …), and doing it by hand is slow and inconsistent, while topics and vocabulary change every week. An article often belongs to more than one section (a heatwave that closes schools is both `environment` and `uk-news`), so we build a system that suggests **one or more sections for every article, always at least one**, from its text and from metadata known at publication time, using full-text articles from The Guardian Open Platform API as both training data and the live stream. The system collects new articles daily, validates and versions them, keeps per-author and per-office features in a feature store, trains and registers models, serves predictions through an API fed by a stream of newly published articles (Kafka) and through a daily batch, and monitors drift so that it retrains when quality degrades. The desired outcome is a reproducible pipeline whose suggestions an editor accepts for at least 85% of articles and which detects its own degradation without waiting for a person to notice.
 
 ---
 
 ## 2 Motivation
 
 **Who consumes the predictions.**
-- *Editorial desk, the only external consumer.* When an article is ready, the CMS asks the system for a suggested section and shows the top 3 to the editor. In this project the CMS is emulated by a client script (`cms-client`) that replays newly published Guardian articles.
+- *Editorial desk, the only external consumer.* When an article is ready, the CMS asks the system for suggested sections and shows them to the editor: at least one, the first being the main section, plus any additional sections the article also belongs to. In this project the CMS is emulated: `guardian-poller` checks the Guardian API every 5 minutes and publishes each new article to the Kafka topic `articles.new`, and `cms-client` reads that stream and requests the suggestion for each article, the way a CMS would when an article is filed (6.3).
 - *Inside the system: monitoring.* A daily batch also scores every article of the previous day. Nobody outside the system reads it. It exists so that drift and quality monitoring (6.6) and the champion/challenger comparison (5.4) see all articles, not only those the CMS sent.
 
-**How often.** Continuously during the day, one request per new article. Assumption: ~250 articles/day, to be confirmed by `response.total` of the first API call (see 5.2).
+**How often.** Continuously during the day, one request per new article, within minutes of publication through the stream. Assumption: ~250 articles/day, to be confirmed by `response.total` of the first API call (see 5.2).
 
 **What happens when a prediction is wrong.** The editor corrects the section by hand (Assumption: ~30 s per correction). If nobody notices, the article lands on the wrong section front and in the wrong newsletter, and loses audience. A wrong suggestion is cheap one at a time but expensive when it is systematic, for example when a new topic appears and the model keeps sending it to `world`.
 
@@ -32,8 +32,8 @@ Newsrooms file every article under a section (politics, business, sport, culture
 
 | # | As a… | I want… | So that… | Where in the design |
 |---|---|---|---|---|
-| U1 | Editor filing an article | to see a suggested section and the top 3 alternatives within a moment of pressing "suggest" | I can file the article in one click instead of choosing from the full section list | F6, `POST /classify`, p95 ≤ 300 ms |
-| U2 | Editor | to pick a different section when the suggestion is wrong | the article lands on the right section front; my choice becomes the correct answer (the label) the system learns from | 5.5, override |
+| U1 | Editor filing an article | to see the suggested sections (at least one: the main section first, then any additional ones) within a moment of pressing "suggest" | I can file the article in one click instead of choosing from the full section list, and it also appears on every other section front it belongs to | F6, `POST /v1/classify`, p95 ≤ 300 ms |
+| U2 | Editor | to change the main section, remove a wrong section or add a missing one | the article lands on the right section fronts; my choice becomes the correct answer (the label set) the system learns from | 5.5, override |
 | U3 | Editor | to move an article to another section during its first day if the story develops | the section reflects what the article turned out to be about | 5.2, 24 h label delay |
 | U4 | Editor | the CMS to keep working if the model is down | publishing is never blocked by the classifier | 4, availability and fallback |
 | U5 | On-call ML engineer | an alert when the model starts going wrong, **before** the correct sections are known | I can react the same day instead of waiting for the quality numbers | 6.6, label-free signals |
@@ -45,19 +45,19 @@ Newsrooms file every article under a section (politics, business, sport, culture
 
 | When (UTC) | What happens | What the system knows about the correct section |
 |---|---|---|
-| Day D, 09:40 | A journalist finishes "Heatwave closes schools across southern England". The CMS calls `POST /classify` and gets `environment` 0.62, `uk-news` 0.24, `world` 0.08. The prediction is logged to `predictions`. | Nothing yet. |
-| Day D, 09:41 | The editor accepts `environment` (U1). The article is published at 10:00, which becomes its `webPublicationDate`. | The editor's choice exists in the CMS, but it may still change. |
-| Day D, 15:00 | The story develops into a story about exam cancellations. The editor moves the article to `uk-news` (U3). | The section has changed. If the system had counted 09:41 as final, it would now hold a wrong label. |
-| Day D+1, 03:00 | `guardian_ingest_daily` downloads all articles of day D, this one included, with its current section `uk-news`. | The section is stored, but the article is only 17 h old, so it is **not used yet**. |
-| Day D+1, 10:00 | 24 h have passed since publication. | The section `uk-news` now counts as the **label**: final and safe to use. |
-| Day D+2, 06:00 | `monitor_daily` joins the logged prediction (`environment`) with the label (`uk-news`). The miss counts against macro-F1 and the acceptance rate (U6). The contributor's history features now include this article. | Used for quality metrics and features. |
+| Day D, 09:40 | A journalist finishes "Heatwave closes schools across southern England". The CMS calls `POST /v1/classify` and gets scores `environment` 0.62, `uk-news` 0.55, `world` 0.08. Two classes pass their thresholds, so the suggestion is `environment` (main) + `uk-news`. The prediction is logged to `predictions`. | Nothing yet. |
+| Day D, 09:41 | The editor accepts both sections (U1). The article is published at 10:00, which becomes its `webPublicationDate`. | The editor's choice exists in the CMS, but it may still change. |
+| Day D, 15:00 | The story develops into a story about exam cancellations. The editor makes `uk-news` the main section; `environment` stays as an additional section through the keyword tag `environment/climate-crisis` (U3). | The main section has changed. If the system had counted 09:41 as final, it would now hold a wrong label. |
+| Day D+1, 03:00 | `guardian_ingest_daily` for target day D downloads every article whose latest edit falls on day D (this one included: its last edit was at 15:00) and merges them into the Delta table `clean/articles` (SCD type 2, one row per version). The API already shows {`uk-news` (main), `environment`}, valid from 15:00, so that is the article's first row. | A version with a section is stored, but it is not the label: 24 h have not passed since publication. |
+| Day D+2, 03:00 | The run for D+1 downloads everything edited on D+1; this article was not edited, so it brings no newer version. A run has now happened after D+1 10:00, so the training query takes the row that was valid at D+1 10:00, 24 h after publication. | The set {`uk-news` (main), `environment`} is the **label**: final and safe to use. |
+| Day D+2, 07:00 | `monitor_daily` joins the logged prediction {`environment` (main), `uk-news`} with the label {`uk-news` (main), `environment`}. Both classes are hits for macro-F1, but the main section was wrong, so the article counts against the acceptance rate (U6). The contributor's history features now include this article. | Used for quality metrics and features. |
 
 What the 24 h delay gives the design:
 1. **It matches how the newsroom works.** A section is final only when editors stop moving the article (U3). A label taken too early would be wrong whenever the section changed later.
 2. **It makes monitoring without labels a real phase.** For the first day after publication, the on-call engineer has only label-free signals: predicted-class mix, confidence, text drift and volume (U5). Labels confirm or dismiss those alerts later (U6). Without a delay, this part of the system would never be exercised, because the Guardian API returns the section together with the article.
 3. **It prevents leakage.** Contributor features may use only labels the system could actually have known at that moment. Otherwise training would see information that serving never has.
 
-Assumption: 24 h is the confirmation window. If the Guardian data shows articles changing section later than that (checked with the `last-modified` sweep in Lab 2), the window is extended.
+Assumption: 24 h is the confirmation window. If the Guardian data shows articles changing section later than that (query `late_label_changes`, 5.2 and 6.6), the window is widened: every version is kept in `clean/articles`, so it is one parameter of the training query, and no data is rewritten.
 
 **Why a system and not a notebook.** News changes continuously: new events bring new vocabulary, sections are reorganised, the label mix shifts with the news cycle. A model trained once in a notebook degrades silently. During dataset selection, a TF-IDF + logistic regression baseline trained on 2014–2015 HuffPost headlines fell from macro-F1 0.617 (2016) to 0.465 (first half of 2018) with no code change. The value here is in the loop around the model: periodic collection, validation, versioning, monitoring for degradation, and retraining by trigger.
 
@@ -69,15 +69,17 @@ Three layers, kept apart. A model can improve while the business metric does not
 
 | Layer | Metric | Target | Role | How it is measured |
 |---|---|---|---|---|
-| Business | **Suggestion acceptance rate**: share of articles where the top-1 suggestion equals the section the editor finally keeps | ≥ 85% (Assumption, revised after Lab 2 baseline) | Decision metric | Emulated: top-1 prediction vs Guardian's editorial `sectionId` after the 24 h label delay |
-| Business | **Top-3 coverage**: final section is among the 3 suggestions | ≥ 95% (Assumption) | Secondary | Same data as above |
-| Model | **Macro-F1** on the most recent fully labelled time window | ≥ 0.80 and ≥ baseline + 0.10 (Assumption) | **Optimizing** | Offline on the held-out period (5.4); online daily once labels arrive |
+| Business | **Suggestion acceptance rate**: share of articles where the suggested main section equals the main section the editor finally keeps | ≥ 85% (Assumption, revised after Lab 2 baseline) | Decision metric | Emulated: predicted main section vs Guardian's editorial `sectionId` after the 24 h label delay |
+| Business | **Top-3 coverage**: final main section is among the 3 highest-scored classes | ≥ 95% (Assumption) | Secondary | Same data as above |
+| Model | **Macro-F1, multi-label**: each class is scored as its own yes/no decision over all articles, and the per-class F1 values are averaged | ≥ 0.80 and ≥ baseline + 0.10 (Assumption) | **Optimizing** | Offline on the held-out period (5.4); online daily once labels arrive |
 | Model | Per-class recall | ≥ 0.60 for every class | **Satisficing** | Same evaluation |
-| System | p95 latency of `POST /classify` | ≤ 300 ms | **Satisficing** | Prometheus histogram |
+| Model | Sections per article: mean number of predicted sections vs mean number of true sections | within ±20% (Assumption) | **Satisficing** | Same evaluation; guards against thresholds that suggest too many or too few sections |
+| System | p95 latency of `POST /v1/classify` | ≤ 300 ms | **Satisficing** | Prometheus histogram |
 | System | Data freshness: previous day ingested, validated and in the feature store | by 06:00 UTC daily | **Satisficing** | Airflow run timestamps; age of newest row in the online store |
+| System | Stream delay: from `webPublicationDate` to the logged online prediction | p95 ≤ 10 min (Assumption: 5 min poll interval + processing) | **Satisficing** | `request_ts − published_at` of the `online` rows in `predictions` |
 | System | API availability | ≥ 99% during the demo window (Assumption: local single-replica deployment) | **Satisficing** | Prometheus `up` and probe results |
 
-Macro-F1 is the optimizing metric because classes are imbalanced (sport and world dominate) and every section matters to its editor. All other metrics are thresholds that a model must satisfy, not maximise.
+Macro-F1 is the optimizing metric because classes are imbalanced (sport and world dominate) and every section matters to its editor. In the multi-label setting it rewards both a correct main section and correct additional sections, while the acceptance rate looks only at the main section, the one the editor files first. All other metrics are thresholds that a model must satisfy, not maximise.
 
 ---
 
@@ -88,40 +90,42 @@ Macro-F1 is the optimizing metric because classes are imbalanced (sport and worl
 | # | Requirement |
 |---|---|
 | F1 | Ingest all articles published in the previous UTC day from the Guardian Content API (`type=article`, full text, tags, fields) and store the raw responses unchanged. |
-| F2 | Validate every batch (schema, volume, nulls, duplicates, unmapped sections) and stop the pipeline on failure. |
-| F3 | Map Guardian `sectionId` to the project label set through a versioned mapping file. |
-| F4 | Compute features per entity (contributor, production office) with event timestamps; publish them to the offline store and materialise the latest values to the online store. |
+| F2 | Validate every batch (quality gate, `validate_batch`). Rows with an empty body, a missing `id` or `sectionId`, or a duplicate `id` are dropped and counted. The run stops if the schema is wrong, the batch is empty, or more than 5% of rows are dropped. Unmapped sections do not stop the run; they go to `other` and are monitored (6.6). |
+| F3 | Build the label set of every article: its main `sectionId` plus the sections of its keyword tags, mapped to project classes through a versioned mapping file. Every label set contains at least one class (the main section). |
+| F4 | Compute features per entity (contributor, production office) once a day with event timestamps; publish them to the offline store and materialise the latest values to the online store. |
 | F5 | Train a baseline and a candidate model on a time-based split; log parameters, metrics, data version and commit; register the model. |
-| F6 | **Online inference.** `POST /classify` accepts `{headline, standfirst, body_text, contributor_ids[], production_office, published_at}` and returns `{section, confidence, top3[], model_version, fallback_used}`. Caller: the CMS (emulated by `cms-client`). |
+| F6 | **Online inference.** `POST /v1/classify` accepts `{article_id, headline, standfirst, body_text, contributor_ids[], production_office, tone, published_at}` and returns `{sections[], main_section, scores{}, top3[], model_version, fallback_used}`, where `sections` always has at least one element. Caller: the CMS (emulated by `cms-client`). |
 | F7 | **Batch inference.** Every day, score all articles of the previous day into the `predictions` table in PostgreSQL. Caller: Airflow; readers: `monitor_daily` (drift and quality, 6.6) and the champion/challenger comparison (5.4). Internal only, no external consumer. |
 | F8 | Monitor inputs, predictions and (after the delay) labels; raise an alert when a threshold is crossed; trigger retraining. |
+| F9 | **Stream of new articles.** `guardian-poller` asks the Guardian API every 5 minutes for articles published since its last poll and publishes each new one, once, to the Kafka topic `articles.new` (key = `article_id`). `cms-client` consumes the topic and calls `POST /v1/classify` for each message. The stream only feeds the online path: training, labels, features and monitoring keep using the daily batch (6.3). |
 
 ### Non-functional requirements
 
 | Category | Requirement |
 |---|---|
-| **Freshness** | Previous day's articles ingested, validated and materialised to the online store by 06:00 UTC. Online features are at most 30 h old (24 h label delay + 6 h pipeline window); older values are treated as missing. |
-| **Latency and throughput** | `POST /classify` p95 ≤ 300 ms, p99 ≤ 800 ms. Sustained 1 request/s, bursts of 5 requests/s. Assumption: ~250 articles/day, peaks of ~30/hour. Daily batch scoring of one day ≤ 10 min. |
-| **Availability and fallback** | API ≥ 99% during the demo window. If the model cannot be loaded, the service answers with the rule-based keyword baseline and sets `fallback_used=true`. If the online store is unreachable or the contributor is unknown, the model uses default feature values (global class prior) instead of failing. If the Guardian API is down, ingestion retries for 6 h and then alerts; the last champion keeps serving. |
+| **Freshness** | Previous day's articles ingested, validated and materialised to the online store by 06:00 UTC. Online feature rows are written once a day with `event_timestamp` = 06:00 UTC (5.3), so a healthy row is at most 24 h old. Feast TTL = 30 h (24 h + 6 h grace for a late run): an older value means the daily feature run failed, and it is treated as missing. Stream: a new article reaches `classifier-api` within 10 min of publication (p95). |
+| **Latency and throughput** | `POST /v1/classify` p95 ≤ 300 ms, p99 ≤ 800 ms. Sustained 1 request/s, bursts of 5 requests/s. Assumption: ~250 articles/day, peaks of ~30/hour. Daily batch scoring of one day ≤ 10 min. Stream: ~250 messages/day, at most 50 per poll; one Kafka partition is enough. |
+| **Availability and fallback** | API ≥ 99% during the demo window. `classifier-api` loads `@champion` at startup and reports ready (`/ready`) only after the model is loaded; a pod without a model receives no traffic, and during a rollout the previous pod keeps serving. If prediction with the loaded model fails for a request, the service answers with the rule-based keyword baseline (lexicon shipped in the image, no MLflow needed) and sets `fallback_used=true`. If the online store is unreachable or the contributor is unknown, the model uses default feature values (global class prior) instead of failing. If the API itself is unavailable, the CMS keeps the editor's manual choice (6.8). If the Guardian API is down, ingestion retries for 6 h and then alerts; the last champion keeps serving. If Kafka is down, `guardian-poller` keeps its last position and catches up on the next successful poll; if `classifier-api` is down, messages wait in the topic (7-day retention) and `cms-client` resumes from its last committed offset, so no article is lost. |
 | **Reproducibility** | Any registered model can be rebuilt from its MLflow run: tags `git_commit`, `data_version` (DVC hash of the training snapshot), `section_map_version`, `feature_service`. `make setup` recreates the environment from `uv.lock`; `dvc pull` restores raw snapshots without a Guardian key. |
-| **Adaptability** | New data enters daily as a new date partition. New models enter through scheduled weekly retraining or a drift-triggered run, as `@challenger`, and replace `@champion` only through the promotion gate (5.4) and a human approval (5.5). New Guardian sections enter through the versioned section map; until mapped they go to `other`. |
-| **Observability without ground truth** | During the 24 h before labels arrive: predicted-class distribution vs the reference window, mean confidence and share of low-confidence predictions (< 0.5), text drift on TF-IDF features, share of `other` / unmapped sections, ingested volume per day, feature freshness. After labels: macro-F1 and acceptance rate per day and per 7-day window. |
-| **Cost and resource ceilings** | Local stack fits in 8 GB RAM and 4 CPU cores (Minikube 4 GB + host services). Training on CPU only, ≤ 30 min per run. Guardian API usage ≤ 400 calls/day, which keeps 20% headroom under the most restrictive reported developer limit (500/day). Raw storage ≤ 5 GB. Monthly cloud cost: $0 for the course (local); managed cloud ≈ $946–1,593/month, self-hosted variant ≈ $350–380/month (6.7). |
+| **Adaptability** | New data enters daily as a new date partition. New models enter through scheduled weekly retraining, a run triggered by the quality alert (6.6), or a run started by the on-call engineer, always as `@challenger`; they replace `@champion` only through the promotion gate (5.4) and a human approval (5.5). New Guardian sections enter through the versioned section map; until mapped they go to `other`. |
+| **Observability without ground truth** | Before labels arrive (24 h after publication, available after the next daily run): predicted-class distribution vs the reference window, mean number of predicted sections per article, mean confidence and share of low-confidence predictions (< 0.5), text drift on TF-IDF features, share of `other` / unmapped sections, ingested volume per day, feature freshness, stream health (time since the last successful poll, consumer lag, share of the day's articles that got an online prediction). After labels: macro-F1 and acceptance rate per day and per 7-day window. |
+| **Cost and resource ceilings** | Local stack fits in 8 GB RAM and 4 CPU cores (Minikube 4 GB + host services). Training on CPU only, ≤ 30 min per run. Guardian API usage ≤ 400 calls/day, which keeps 20% headroom under the most restrictive reported developer limit (500/day): the poller uses 288 (one call every 5 min), the daily batch ≤ 3 (one `last-modified` request for day D, 2 pages measured), the weekly takedown check ~35; the one-off backfill runs with the poller stopped. Kafka: one broker, ≤ 1 GB RAM inside the Minikube budget. Raw storage ≤ 5 GB. Monthly cloud cost: $0 for the course (local); managed cloud ≈ $946–1,593/month, self-hosted variant ≈ $350–380/month (6.7). |
 
 ### In scope
 
 - English Guardian articles of `type=article` from 2024-01-01 onwards, with full body text.
-- Single-label classification into the project label set (5.1).
-- Daily batch ingestion; online and batch inference; drift monitoring and retraining loop.
+- Multi-label classification into the project label set: every article gets at least one section (5.1).
+- Daily batch ingestion; a Kafka stream of new articles that feeds online inference; online and batch inference; drift monitoring and retraining loop.
 - Local deployment on the reference stack; cloud equivalents named, not deployed.
 
 ### Out of scope
 
 - Live blogs, galleries, video, audio, interactives, crosswords (non-`article` types).
 - Opinion pillar (`commentisfree`): opinion pieces span all topics and have their own editorial flow. Assumption: revisited after Lab 2 error analysis.
-- Multi-label tagging with Guardian keyword tags; images and video.
+- Predicting individual Guardian keyword tags (thousands of labels); images and video.
 - Languages other than English; sources other than the Guardian.
 - Writing back to a real CMS; any commercial use of Guardian content.
+- Stream processing (Spark, Flink, Kafka Streams): the stream only carries new articles to the online API; features and labels are computed in the daily batch (7.1).
 
 ---
 
@@ -129,9 +133,14 @@ Macro-F1 is the optimizing metric because classes are imbalanced (sport and worl
 
 ### 5.1 Problem statement
 
-**Framing: single-label multi-class text classification.** Input: an article at publication time (headline, standfirst, body text, contributor ids, production office, publication time). Output: one of the project sections, with a probability per class.
+**Framing: multi-label text classification with at least one label per article.** Input: an article at publication time (headline, standfirst, body text, contributor ids, production office, publication time). Output: a non-empty set of project sections, a probability per class, and the main section (the class with the highest probability).
 
-**Label set.** Guardian `sectionId` values mapped to 12 classes by `configs/section_map.yaml` (versioned in Git):
+- *Why multi-label.* Many articles belong to several sections at once: a heatwave closing schools is `environment` and `uk-news`, a tech company's earnings are `technology` and `business`. Forcing one class makes the model "wrong" on articles where the second section is just as correct.
+- *Why at least one.* Every Guardian article has a main `sectionId`, and the editor must file it somewhere. An empty answer is never useful, so the model always returns at least the main section (5.3).
+
+**Label set of an article.** The **main section** is the mapped `sectionId`. The **additional sections** are the mapped sections of the article's keyword tags: in the Guardian API every keyword tag has its own `sectionId` (`environment/climate-crisis` → `environment`). The label set is the union of both, so it always has at least one class. A keyword tag whose section maps to `other` adds nothing: `other` can only be a main section, never an additional one. Assumption: one keyword tag is enough to add a section; Lab 2 measures the number of labels per article and raises this to two tags if additional sections turn out too noisy.
+
+**Classes.** Guardian `sectionId` values mapped to 12 classes by `configs/section_map.yaml` (versioned in Git):
 
 | Class | Guardian `sectionId` values (initial mapping) |
 |---|---|
@@ -150,40 +159,50 @@ Macro-F1 is the optimizing metric because classes are imbalanced (sport and worl
 
 Assumption: the mapping is final only after counting `sectionId` frequencies over one month of real data; classes below 1% of volume are merged.
 
-**Rejected framing: multi-label classification over Guardian keyword tags.** It would be closer to how the Guardian tags content, but keyword tag ids start with the section name (`football/premierleague`), so they leak the label. The label space is also thousands of tags with a long tail, and per-tag evaluation would be meaningless with our data volume. A second rejected option, the 5 `pillarName` values (News, Opinion, Sport, Arts, Lifestyle), is too coarse to be useful to an editor.
+**Rejected framings.**
+- *Single-label classification (main section only).* Simpler, but it ignores that articles span sections and counts a correct second section as an error.
+- *Predicting the individual keyword tags.* The label space is thousands of tags with a long tail, and per-tag evaluation would be meaningless with our data volume. We use keyword tags only to derive additional sections, never as model inputs: tag ids start with the section name (`football/premierleague`), so as inputs they would leak the label.
+- *The 5 `pillarName` values* (News, Opinion, Sport, Arts, Lifestyle): too coarse to be useful to an editor.
 
 ### 5.2 Data
 
 **Source.** The Guardian Open Platform Content API, `https://content.guardianapis.com/search`. Owner: Guardian News & Media. Access: free developer key, non-commercial use; Guardian staff have confirmed that student projects are allowed.
 
-**Request per batch.**
+**Request per batch.** One request per run: every article whose latest edit (`lastModified`) falls on day D.
 ```
-/search?from-date=D&to-date=D&use-date=published&type=article
+/search?from-date=D&to-date=D&use-date=last-modified&type=article
        &order-by=oldest&page-size=200&page=N
-       &show-fields=headline,standfirst,trailText,bodyText,byline,wordcount,
+       &show-fields=headline,standfirst,bodyText,
                     firstPublicationDate,lastModified,productionOffice,lang
-       &show-tags=contributor,keyword,tone,series
+       &show-tags=contributor,keyword,tone
        &api-key=$GUARDIAN_API_KEY
 ```
 
-**Arrival pattern.** Articles are published continuously. The pipeline collects them as one daily batch per UTC day (`guardian_ingest_daily`, 03:00 UTC). A second query with `use-date=last-modified` picks up articles changed in the last 3 days, so corrections reach the raw layer.
+**Arrival pattern.** Articles are published continuously. The pipeline collects them as one daily batch per UTC day (`guardian_ingest_daily`, 03:00 UTC). Each run ingests the **target day** = the UTC day before the run's logical date: in Airflow 3 a cron schedule sets the logical date to the run time, so the run at 03:00 on D+1 has logical date D+1 and ingests D. Why one request is enough:
+- **New and changed articles come together.** Publishing sets `lastModified`, so a new article appears on the day it was published; an edit moves it to the day of the edit, so a section change of an older article reaches `clean` in the next run. Measured for 2026-10-23: 271 articles last modified that day = 176 published that day + 95 published earlier (58 of them the day before) and edited on the 23rd. Another 10 published on the 23rd were edited after midnight and appear in the 24th instead.
+- **Every article lands in exactly one partition per edit,** so there is no overlap to deduplicate in raw and no separate "changes" query. Only intermediate versions are invisible: two edits on the same day give one version, the later one. Any polling design has this limit.
+- **Raw is written once.** The same request sent again later returns a different, smaller set (articles edited since then have moved to a later day). So a rerun reuses the existing partition `date=D` and does not download it again; it only merges the same versions into `clean/articles`, which changes nothing, so the run is idempotent. A partition is written only when all its pages have been fetched.
+- **Merge into `clean/articles` (SCD type 2).** Every version in the partition becomes one row, keyed by the surrogate key `version_id` = md5(`article_id` | `lastModified`); `article_id` is the natural key and `valid_from` = `lastModified`. Two Delta `MERGE` statements: the first inserts versions the table does not have yet (a rerun inserts nothing); the second closes the previous version of each changed article, setting `valid_to` = the new version's `valid_from` and `is_current` = false.
 
-**Volume.** Assumption: ~250 articles/day, ~1–3 calls/day. To be replaced by the measured `response.total` of a sample week.
+**Stream of new articles (online path only).** `guardian-poller` sends `/search?from-date=<last poll − 10 min>&use-date=published&type=article&order-by=newest&page-size=50` with the same fields and `show-tags=contributor,tone` (no keyword tags: they are not inputs) every 5 minutes. The 10-minute overlap catches articles that appear in the API late; ids already published to the topic are skipped. On start, the poller takes its position from the last message in `articles.new`, so it needs no extra state. These messages are **not** written to the data lake: the daily batch stays the single source for training data, labels and features, so the two paths cannot produce two different datasets.
 
-**History.** Backfill 2024-01-01 → 2026-09-30 (33 months, Assumption: ~250k articles). Paged by month at 200 articles per call, that is ~1,300 calls, or about 4 days of runs capped at 400 calls/day.
+**Volume.** Measured for 2026-10-23: 186 articles published, 271 last modified (small corrections and live blogs also change `lastModified`), so 2 calls/day for the batch at 200 per page; 288 calls/day for the poller. Assumption: one day is representative; to be confirmed with the `response.total` of a sample week.
+
+**History.** Backfill 2024-01-01 → 2026-09-30 (33 months, Assumption: ~250k articles). Paged by month at 200 articles per call with the same `use-date=last-modified` request, written to `data/raw/guardian/backfill/month=YYYY-MM/`; the backfill ends the day before the first daily run, so every article sits in exactly one raw partition. That is ~1,300 calls, or about 4 days of runs capped at 400 calls/day. Backfilled articles are months old, so one download serves both as the first-seen inputs and as the label: for backfilled days the one download is the only version merged into `clean/articles`.
 
 **Labels and their delay.**
-- The label is the editorial `sectionId`, mapped to the project class.
+- The label is the article's label set (5.1): the editorial `sectionId` as the main section plus the sections of its keyword tags, mapped to project classes. It always contains at least one class.
 - **The Guardian API gives the label immediately, but the system pretends it arrives 24 h later.**
   - In the API, every article already comes with its `sectionId`, so technically the label is known right away.
   - In a real newsroom the final section is confirmed by an editor some time after publication. To emulate this, the system treats the label as **unknown for the first 24 h** after `webPublicationDate`.
   - This makes "monitoring without labels" (6.6) a real phase: for the first 24 h, only signals that need no label are available.
   - A step-by-step example of one article, with the user stories behind the rule, is in 2 (Motivation).
 - **What the 24 h rule means in practice:**
-  - Quality metrics (macro-F1, acceptance rate) are computed only on articles published more than 24 h ago.
-  - Contributor and office history features (5.3) count only articles older than 24 h, so they never use a label the system should not know yet.
+  - An article's label is the label set of its row in `clean/articles` that was valid 24 h after `webPublicationDate` (`valid_from` ≤ publication + 24 h < `valid_to`). It counts only once a daily run has happened after that moment, so in practice from the first run at least 24 h after publication. Before that, the article has no label.
+  - Quality metrics (macro-F1, acceptance rate) are computed only on articles that have a label.
+  - Contributor and office history features (5.3) count only articles that have a label, so they never use a label the system should not know yet.
   - The model never receives the label as an input; at serving time the section is what it predicts.
-- A label changes if the Guardian moves the article; the `last-modified` sweep records the change.
+- **Text and label come from different versions of the article.** Inputs (text, contributors, office, tone) come from the article's first row, the closest to what the CMS sent at publication. The label comes from the row valid at 24 h, so a move made during the first day (U3) ends up in the label. A change after 24 h becomes a new row and is counted (`late_label_changes`) but does not change the label.
 
 **Available at serving time vs training time.**
 
@@ -191,16 +210,19 @@ Assumption: the mapping is final only after counting `sectionId` frequencies ove
 |---|---|---|
 | `headline`, `standfirst`, `bodyText`, `wordcount` | ✅ | ✅ in the request |
 | Contributor tag ids, `productionOffice`, publication time, tone tag | ✅ | ✅ in the request |
-| Contributor and office history features | ✅ point-in-time from the offline store | ✅ latest value from the online store (labels older than 24 h only) |
+| Contributor and office history features | ✅ point-in-time from the offline store | ✅ latest value from the online store (final labels only) |
 | `sectionId`, `sectionName`, `pillarName` | ✅ as **target only** | ❌ (that is what we predict) |
-| `id`, `webUrl`, keyword / series / newspaper-section tags | ❌ excluded (leak the label) | ❌ |
-| Later edits (`lastModified` > publication) | ❌ only the first-seen version is used for training | ❌ |
+| Keyword tags | ✅ as **target only** (their `sectionId` gives the additional sections) | ❌ (they leak the label) |
+| `id`, `webUrl`, series and newspaper-section tags | ❌ not used as inputs (`id` and `webUrl` start with the section name; series and newspaper-section tags are not requested) | ❌ |
+| Later edits (`lastModified` > publication) | ❌ as inputs: inputs come from the first-seen version. ✅ for the label: the version valid 24 h after publication; later versions are kept in `clean/articles` but not used | ❌ |
 
-**Storage layers.**
-- **raw:** JSON responses exactly as received, partitioned `raw/guardian/date=YYYY-MM-DD/page-N.json` in MinIO, immutable.
-- **clean:** Parquet, one row per article (deduplicated by `id`, first-seen version), typed columns, mapped label, partitioned by `date=`.
+**Storage layers.** One copy of each layer, in the DVC-tracked folder `data/` (shared by the Airflow containers). MinIO holds the durable copy as the DVC remote.
+- **raw:** JSON responses exactly as received, one partition per run, keyed by the run's target day: `data/raw/guardian/date=YYYY-MM-DD/page-N.json` holds every article last modified on D. Only the run for day D writes that partition, once; a rerun reuses it. JSON, because it is the exact response: a parsing bug in `clean_transform` is fixed by rebuilding `clean` from the original bytes, fields not used yet (`body`, all tag types) are kept for later labs, and `validate_batch` checks the schema on what was actually received. Raw is the single source of truth: `clean/articles` can be rebuilt at any time by merging all raw partitions in date order, which gives the same table.
+- **clean:** one Delta Lake table, `data/clean/articles`, SCD type 2: one row per version of an article, no partition folders. Columns: `version_id` (surrogate key), `article_id` (natural key), `published_at`, the inputs (typed; leaking fields dropped; `commentisfree` articles removed, out of scope, 4), `main_section`, `label_set`, `section_map_version`, `valid_from`, `valid_to`, `is_current`, `loaded_at`. Written with Delta `MERGE` (deltalake, no Spark); read with SQL. Two queries in `sql/articles.sql` are shared by training, `build_features`, `score_batch_daily` and `monitor_daily`:
+  - `training_rows`: inputs from each article's first row, label from the row valid at publication + 24 h, only for articles published at least 24 h before the latest `loaded_at`;
+  - `late_label_changes`: rows with `valid_from` > publication + 24 h.
 - **features:** Parquet with `event_timestamp` per entity (Feast offline source), plus the PostgreSQL online store.
-- **Versioning:** DVC tracks a snapshot of the raw and clean layers (`dvc add`), remote in the MinIO `dvc` bucket. The DVC hash is the data version.
+- **Versioning:** after the quality gate passes, the ingest DAG runs `dvc add data/raw data/clean` and `dvc push` to the MinIO `dvc` bucket. The resulting hash is the data version. `train_classifier` stores it on every MLflow run as the `data_version` tag and logs the `.dvc` file as a run artifact, so `dvc pull` with that file restores exactly that snapshot without Airflow committing to Git. The `.dvc` file is also committed to Git with each lab tag.
 
 **Dataset checklist (Lab 1, step 1).**
 
@@ -208,18 +230,19 @@ Assumption: the mapping is final only after counting `sectionId` frequencies ove
 |---|---|
 | Time axis | Every article has `webPublicationDate` to the second; the API filters by `from-date`/`to-date`, so "next day" and "next month" batches are real requests, not a replay. New data keeps arriving, so Lab 4 can observe real drift as well as emulate it. |
 | History to hold out a period | 33 months of backfill (2024-01 → 2026-09). Hold-out: 2026-04 → 2026-06 as test; 2026-07 → 2026-09 replayed as "production" months; live data after that (5.4). |
-| Labels with known delay | Editorial `sectionId` on every article. Delay: 24 h, emulated as an editor confirmation window (Assumption, chosen to make monitoring without labels a real phase). |
+| Labels with known delay | Editorial `sectionId` (main section) and keyword tags (additional sections) on every article, so every article has at least one label. Delay: 24 h, emulated as an editor confirmation window; every version of an article is a row in `clean/articles` (SCD type 2) and the label is the row valid at 24 h (Assumption, chosen to make monitoring without labels a real phase). |
 | Text surface or corpus | Full article body text (`bodyText`, Assumption: median several hundred words). The same corpus is the document base for the Lab 3 retrieval component. |
 
 ### 5.3 Techniques
 
-**Baseline first: rule-based keyword classifier.** For each class, a lexicon of 20–40 keywords is built once from training-period headlines (most discriminative terms, reviewed by hand). An article is assigned to the class with the most keyword hits in headline + standfirst, with ties going to the most frequent class. It needs no model file, runs in microseconds, and is the **production fallback** (4, Availability).
+**Baseline first: rule-based keyword classifier.** For each class, a lexicon of 20–40 keywords is built once from training-period headlines (most discriminative terms, reviewed by hand). An article gets every class with at least 2 keyword hits in headline + standfirst; the class with the most hits is the main section. If no class reaches 2 hits, it gets the single class with the most hits, or the most frequent class when there are none, so it always returns at least one section. The lexicon is a versioned file (`configs/keyword_lexicon.yaml`) baked into the `classifier-api` image, so the baseline needs no model file and no MLflow, runs in microseconds, and is the **production fallback** (4, Availability).
 
 **Candidate: TF-IDF + logistic regression with metadata features** (scikit-learn).
 - Text: headline, standfirst and the first 300 words of the body, word 1–2-grams, sublinear TF.
 - Metadata: one-hot production office and tone tag, publication hour, log word count.
 - Feature-store features: contributor and office history (below).
-- One-vs-rest logistic regression with class weights.
+- One-vs-rest logistic regression with class weights: one yes/no classifier per class, which is what makes the model multi-label.
+- Decision rule: every class whose probability is at or above its own threshold is returned (thresholds tuned per class on the validation window to maximise that class's F1). If no class passes, the class with the highest probability is returned. The main section is always the class with the highest probability. So the answer is never empty.
 
 It trains in minutes on CPU, is reproducible and is easy to explain. A transformer fine-tune is an alternative for later (7.1), not a requirement.
 
@@ -228,13 +251,15 @@ It trains in minutes on CPU, is reproducible and is easy to explain. A transform
 | Feature | Entity | Computation | Training source | Serving source |
 |---|---|---|---|---|
 | `tfidf(headline + standfirst + body[:300])` | article | vectoriser fitted on the training window | clean Parquet | request body |
-| `log_wordcount` | article | `log1p(wordcount)` | clean Parquet | request body |
+| `log_wordcount` | article | `log1p` of the number of words in `body_text`, counted by the shared feature code (not the API's `wordcount` field, which the request does not carry) | clean Parquet | request body |
 | `pub_hour`, `pub_weekday` | article | from `published_at` | clean Parquet | request body |
-| `tone` | article | tone tag (news, comment, interview, …) | clean Parquet | request body |
+| `tone` | article | tone tag (news, comment, interview, …), chosen in the CMS before publication | clean Parquet | request body |
 | `production_office` | article | one-hot UK / US / AUS | clean Parquet | request body |
-| `contrib_class_share_30d[k]` | contributor | share of the contributor's articles in class k over the last 30 days, **labels older than 24 h only** | Feast offline store, point-in-time join | Feast online store, key = `contributor_id` |
-| `contrib_articles_30d` | contributor | count over the last 30 days | Feast offline store | Feast online store |
-| `office_class_share_7d[k]` | production office | class distribution over the last 7 days | Feast offline store | Feast online store, key = `production_office` |
+| `contrib_class_share_30d[k]` | contributor | share of the contributor's articles over the last 30 days whose label set contains class k | Feast offline store, point-in-time join | Feast online store, key = `contributor_id` |
+| `contrib_articles_30d` | contributor | count of the contributor's articles over the last 30 days | Feast offline store, point-in-time join | Feast online store |
+| `office_class_share_7d[k]` | production office | share of the office's articles over the last 7 days whose label set contains class k | Feast offline store, point-in-time join | Feast online store, key = `production_office` |
+
+**How the history features respect the 24 h label delay.** The task `build_features` of the run for target day D writes one row for **every** contributor active in the last 30 days and for every office, with `event_timestamp` = 06:00 UTC of D+1. Each row counts only articles that have a final label in `training_rows` when the run starts (published at least 24 h before the run, so at least 27 h before that timestamp), so it never uses a label the system should not know yet. The last task, `materialize`, waits until 06:00 and copies the rows to the online store, so a row is served from exactly its `event_timestamp` onwards. Training and batch scoring read the latest row with `event_timestamp` ≤ the article's `published_at` (point-in-time join); serving at the same moment reads that same row from the online store. Because every active contributor gets a row every day, the 30 h TTL (4, Freshness) expires only when the daily run fails, not when a journalist simply did not write yesterday.
 
 For articles with several contributors, contributor features are averaged. An unknown contributor gets the global class prior and `contrib_articles_30d = 0`.
 
@@ -258,9 +283,11 @@ For articles with several contributors, contributor features are averaged. An un
 - contributor statistics computed with labels from the future, which point-in-time joins and the 24 h label delay rule out;
 - label leakage through URLs and keyword tags, which are excluded (5.2).
 
-**Offline metric.** Macro-F1 on the test window, plus per-class recall and the confusion matrix. A rolling-origin check (train up to month M, test on M+1, for the last 6 months) measures how fast quality decays, which sets the retraining cadence.
+**Offline metric.** Multi-label macro-F1 on the test window, plus per-class precision and recall, main-section accuracy (the offline acceptance rate), the mean number of sections per article, and the confusion matrix of the main section. A rolling-origin check (train up to month M, test on M+1, for the last 6 months) measures how fast quality decays, which sets the retraining cadence.
 
-**Comparing a new model with the current one.** Both models are scored on **the same most recent fully labelled window** (the last 14 days with labels). The challenger is promoted to `@champion` only if all of these hold:
+**Retraining windows.** The table above is for the first model. A retraining run (weekly, or triggered, 4 Adaptability) uses a rolling version of the same split: the **last 14 labelled days** (publication days whose articles all have a final label) are the comparison window and are never trained on; the 14 days before them are the validation window for the per-class thresholds; everything earlier since 2024-01-01 is training data.
+
+**Comparing a new model with the current one.** Both models are scored on **the same comparison window**: the last 14 labelled days, which neither of them was trained on. The challenger is promoted to `@champion` only if all of these hold:
 1. macro-F1 ≥ champion + 0.01;
 2. no class recall drops by more than 0.05;
 3. p95 latency in a load test ≤ 300 ms;
@@ -274,9 +301,9 @@ Results are logged to MLflow; the comparison report is attached to the challenge
 | Situation | Who | Action and expected response time |
 |---|---|---|
 | Drift or quality alert | On-call ML engineer (in this project: the repository owner) | Receives a Grafana alert by e-mail and opens the Evidently report within 1 working day. Decides: ignore (news-cycle spike), update the section map, or start retraining. Decision logged in `docs/incidents.md`. |
-| Model promotion | Model owner | Reviews the challenger-vs-champion report in MLflow and moves the `@champion` alias by hand. The automatic gate (5.4) only proposes. |
-| Rollback | Model owner | Points `@champion` back to the previous version; `classifier-api` reloads on the next readiness check. |
-| Override of a prediction | Editor (emulated) | Picks a different section in the CMS. The final section is stored as the label with `source=editor`, and the disagreement counts against the acceptance rate. |
+| Model promotion | Model owner | Reviews the challenger-vs-champion report in MLflow, moves the `@champion` alias by hand and restarts `classifier-api` (`kubectl rollout restart`); the new pod loads the new `@champion` at startup, and `score_batch_daily` picks it up on its next run. The automatic gate (5.4) only proposes. |
+| Rollback | Model owner | Points `@champion` back to the previous version and restarts `classifier-api` the same way. |
+| Override of a prediction | Editor (emulated) | Changes the main section, removes a wrong section or adds a missing one in the CMS. In this project the editor's final choice is the version the Guardian API shows 24 h after publication (`sectionId` and keyword tags), so it becomes the label set with no separate override store. A changed main section counts against the acceptance rate; any changed section counts against macro-F1. |
 | New Guardian section appears | Model owner | Adds it to `configs/section_map.yaml` (versioned). Until then it maps to `other`, which is monitored. |
 
 ---
@@ -289,12 +316,12 @@ Results are logged to MLflow; the comparison report is attached to the challenge
 
 ```mermaid
 flowchart LR
-  GU["The Guardian Open Platform API"] -->|"articles: full text, tags, fields"| SYS
-  GU -->|"labels: editorial sectionId, after 24 h"| SYS
+  GU["The Guardian Open Platform API"] -->|"articles: daily batch + polled every 5 min"| SYS
+  GU -->|"labels: sectionId + keyword-tag sections, after 24 h"| SYS
   SYS["Guardian news section classifier<br/>ingests, validates, trains,<br/>serves, monitors"]
   CMS["Editorial desk<br/>(CMS, emulated by cms-client)"] -->|"article at publication"| SYS
-  SYS -->|"suggested section, top-3, confidence"| CMS
-  SYS -->|"drift and quality alerts by e-mail"| OC["On-call ML engineer"]
+  SYS -->|"suggested sections (at least one), main section, scores"| CMS
+  SYS -->|"drift and quality alerts by e-mail"| OC["On-call ML engineer and model owner<br/>(the repository owner)"]
   OC -->|"promotion approval, rollback, section map"| SYS
 ```
 
@@ -303,17 +330,20 @@ flowchart LR
 ```mermaid
 flowchart TB
   subgraph L1["1 Data ingestion"]
-    GAPI["Guardian Content API"] --> ING["Airflow DAG guardian_ingest_daily"]
-    ING --> RAW[("MinIO raw/guardian/date=")]
+    GAPI["Guardian Content API"] --> ING["Airflow DAG guardian_ingest_daily<br/>target day = logical date − 1"]
+    ING --> RAW[("data/raw/guardian/date=D<br/>articles last modified on D,<br/>JSON as received, written once")]
+    GAPI -->|"every 5 min"| POLL["guardian-poller<br/>stream producer"]
+    POLL --> KAF[("Kafka topic articles.new<br/>key = article_id")]
   end
   subgraph L2["2 Preprocessing and transformation"]
-    VER{{"VERSION POINT<br/>DVC snapshot of raw and clean"}}
-    QG{{"QUALITY GATE<br/>validate_batch: schema, volume,<br/>nulls, duplicates, unmapped sections"}}
-    CLEAN["clean_transform: dedupe by id, map labels,<br/>strip leaking fields"]
-    CL[("MinIO clean Parquet")]
+    QG{{"QUALITY GATE<br/>validate_batch: schema, empty batch,<br/>bad rows dropped, stop if > 5%"}}
+    CLEAN["clean_transform: MERGE every version seen,<br/>section map, drop out-of-scope and leaking fields"]
+    CL[("data/clean/articles<br/>Delta table, SCD type 2")]
+    VER{{"VERSION POINT<br/>dvc add data/raw data/clean,<br/>dvc push to MinIO"}}
   end
   subgraph L3["3 Feature store: Feast"]
-    OFF[("Offline store<br/>Parquet in MinIO features")]
+    FB["build_features: contributor_stats,<br/>office_stats, final labels only"]
+    OFF[("Offline store<br/>Parquet in data/features")]
     ON[("Online store<br/>PostgreSQL")]
   end
   subgraph L4["4 Training pipeline"]
@@ -323,43 +353,53 @@ flowchart TB
     REG[("MLflow Registry<br/>news-section-classifier<br/>@champion / @challenger")]
   end
   subgraph L6["6 Inference"]
-    API["classifier-api: POST /classify<br/>real-time"]
+    API["classifier-api: POST /v1/classify<br/>real-time"]
     BAT["Airflow DAG score_batch_daily<br/>batch"]
     PRED[("PostgreSQL predictions")]
   end
   subgraph L7["7 Monitoring and retraining loop"]
     MON["Airflow DAG monitor_daily<br/>Evidently reports"]
-    PROM["Prometheus + Grafana<br/>metrics, dashboards, alerts"]
+    MM[("PostgreSQL monitoring_metrics")]
+    PROM["Prometheus<br/>service metrics"]
+    GRAF["Grafana<br/>dashboards and alert rules"]
   end
   RAW --> QG
   QG -->|"pass"| CLEAN --> CL
-  QG -->|"fail: stop and alert"| PROM
+  QG -->|"fail: stop, record result"| MM
+  CL --> VER
   RAW -.-> VER
-  CL -.-> VER
-  CL --> OFF
+  CL --> FB --> OFF
   OFF ==>|"TRAINING PATH<br/>point-in-time join"| TRN
-  OFF ==>|"SERVING PATH<br/>materialize"| ON
-  CL -->|"training text"| TRN
+  OFF ==>|"SERVING PATH<br/>materialize at 06:00"| ON
+  CL -->|"training_rows: inputs = first row"| TRN
+  CL -->|"training_rows: label = row valid at +24 h"| TRN
   TRN -->|"log run, register"| REG
-  REG -->|"load @champion"| API
-  REG -->|"load @champion"| BAT
+  REG -->|"load @champion at startup"| API
+  REG -->|"load @champion per run"| BAT
   ON -->|"get_online_features"| API
-  ON --> BAT
-  CMSC["cms-client"] -->|"article"| API
-  API -->|"section"| CMSC
-  BAT --> PRED
-  API -->|"inputs, predictions, latency"| PROM
+  OFF -->|"point-in-time join at published_at"| BAT
+  CL -->|"articles of target day"| BAT
+  KAF -->|"consume, commit offset after 2xx"| CMSC["cms-client<br/>stream consumer"]
+  CMSC -->|"article"| API
+  API -->|"sections"| CMSC
+  API -->|"online predictions"| PRED
+  BAT -->|"batch predictions"| PRED
+  API -->|"latency, requests, fallback"| PROM
+  POLL -->|"last successful poll"| PROM
+  CMSC -->|"consumer lag"| PROM
   PRED --> MON
-  CL -->|"labels after 24 h"| MON
-  MON --> PROM
-  PROM -->|"alert e-mail"| OCE["On-call ML engineer"]
+  CL -->|"label = row valid at +24 h"| MON
+  MON -->|"drift and quality metrics"| MM
+  MM --> GRAF
+  PROM --> GRAF
+  GRAF -->|"alert e-mail"| OCE["On-call ML engineer"]
   MON -->|"trigger retraining"| TRN
 ```
 
 The three required marks:
-1. **Version point:** DVC snapshot of the raw and clean layers. Every MLflow run is tagged with its hash.
+1. **Version point:** after the quality gate passes, `dvc add` + `dvc push` of `data/raw` and `data/clean`. Every MLflow run is tagged with the resulting hash.
 2. **Quality gate:** `validate_batch`, before anything reaches the clean layer or the feature store.
-3. **Where training and serving diverge:** the offline side of Feast feeds `train_classifier` through point-in-time joins; the online side, materialised to PostgreSQL, feeds `classifier-api` and `score_batch_daily`.
+3. **Where training and serving diverge:** the offline side of Feast feeds `train_classifier` (and `score_batch_daily`) through point-in-time joins at each article's `published_at`; the online side, materialised to PostgreSQL, feeds `classifier-api`. Both sides hold the same daily rows (5.3), so a value read online equals the value a point-in-time join returns for the same moment. Batch scoring uses the offline side because it scores past articles, including replayed months (6.3), which the online store, holding only the latest values, cannot serve.
 
 #### Deployment, first draft
 
@@ -367,58 +407,72 @@ The three required marks:
 flowchart TB
   subgraph DEV["Developer laptop: Docker Desktop"]
     subgraph COMPOSE["Docker Compose (Lab 2)"]
-      MINIO["MinIO pgsty/silo<br/>→ S3 / Cloud Storage / Blob Storage"]
+      MINIO["MinIO pgsty/silo: DVC remote, MLflow artifacts<br/>→ S3 / Cloud Storage / Blob Storage"]
       PG["PostgreSQL 16<br/>→ RDS / Cloud SQL / Azure DB for PostgreSQL"]
-      AF["Airflow 3.3.1 LocalExecutor<br/>→ MWAA / Cloud Composer / Fabric Airflow job"]
+      AF["Airflow 3.3.1 LocalExecutor, runs Evidently in monitor_daily<br/>→ MWAA / Cloud Composer / Fabric Airflow job"]
       MLF["MLflow 3.16.1<br/>→ SageMaker with MLflow / Vertex AI / Azure ML"]
       FEAST["Feast 0.66.0<br/>→ SageMaker FS / Vertex AI FS / Azure ML FS"]
     end
     subgraph MK["Minikube 1.33.1, Kubernetes 1.30.0 (Lab 4) → EKS / GKE / AKS"]
       CAPI["classifier-api: FastAPI + model<br/>image in Minikube registry → ECR / Artifact Registry / ACR"]
       MONS["Prometheus + Grafana<br/>→ CloudWatch / Cloud Monitoring / Azure Monitor"]
-      EVI["Evidently reports<br/>→ SageMaker Model Monitor / Vertex AI Model Monitoring / Azure ML monitoring"]
+      KAFKA["Kafka 4.3.1, one broker, KRaft<br/>→ Amazon MSK / Managed Service for Apache Kafka / Event Hubs"]
+      POLLER["guardian-poller<br/>→ pod on EKS / GKE / AKS"]
+      CMSC2["cms-client<br/>→ pod on EKS / GKE / AKS"]
     end
-    DVCC["DVC 3.67.1 client, remote on MinIO<br/>→ S3 / GCS / Azure Blob remote"]
+    DVCC["DVC 3.67.1 client, data/ folder, remote on MinIO<br/>→ S3 / GCS / Azure Blob remote"]
   end
   GH["GitHub: repository + Actions lint CI"]
   GAPI2["Guardian Content API (external)"]
   GAPI2 --> AF
-  AF --> MINIO
+  AF --> DVCC
   AF --> PG
   AF --> MLF
   AF --> FEAST
   FEAST --> PG
-  FEAST --> MINIO
+  FEAST -->|"offline Parquet in data/features"| DVCC
   MLF --> PG
   MLF --> MINIO
   DVCC --> MINIO
   CAPI --> PG
   CAPI --> MLF
-  MONS --> CAPI
+  MONS -->|"scrape"| CAPI
+  MONS -->|"monitoring_metrics"| PG
+  GAPI2 --> POLLER
+  POLLER --> KAFKA
+  KAFKA --> CMSC2
+  CMSC2 --> CAPI
+  MONS -->|"scrape"| POLLER
+  MONS -->|"scrape"| CMSC2
   GH -.->|"code"| DEV
 ```
+
+Evidently is a Python library, not a service: `monitor_daily` runs it inside Airflow, writes the numbers to `monitoring_metrics` and logs each HTML report as an artifact of the MLflow experiment `monitoring`, where the on-call engineer opens it.
 
 ### 6.2 Infra
 
 | Component | Role in this system | Local (pinned) | AWS | GCP | Azure |
 |---|---|---|---|---|---|
-| Object storage | Raw JSON, clean and feature Parquet, MLflow artifacts, DVC remote | MinIO-compatible `pgsty/silo` (buckets `raw`, `clean`, `features`, `mlflow`, `dvc`) | Amazon S3 | Cloud Storage | Blob Storage |
-| Data versioning | Snapshot of raw and clean layers; data version = DVC hash | DVC 3.67.1 + dvc-s3 3.3.0, remote on MinIO | S3 remote | GCS remote | Azure Blob remote |
-| Database | Feast online store, MLflow backend, `predictions` table, Airflow metadata | PostgreSQL 16 | Amazon RDS | Cloud SQL | Azure Database for PostgreSQL |
-| Orchestrator | DAGs `guardian_ingest_daily` (tasks `validate_batch`, `clean_transform`), `score_batch_daily`, `monitor_daily`, `train_classifier` | Apache Airflow 3.3.1, LocalExecutor | Amazon MWAA | Cloud Composer | Apache Airflow job in Microsoft Fabric (Data Factory's managed Airflow is closed to new instances, see 6.7) |
+| Object storage | Durable copy of the data lake (raw JSON, clean Delta table) as the DVC remote; MLflow artifacts (models, Evidently reports) | MinIO-compatible `pgsty/silo` (buckets `dvc`, `mlflow`) | Amazon S3 | Cloud Storage | Blob Storage |
+| Data versioning | Tracks the `data/` folder (raw, clean); snapshot after each passed quality gate; data version = DVC hash | DVC 3.67.1 + dvc-s3 3.3.0, remote on MinIO | S3 remote | GCS remote | Azure Blob remote |
+| Table format | `clean/articles`: SCD type 2 article versions, updated with `MERGE`; partitioning and file bookkeeping are left to the transaction log `_delta_log/`. DVC still versions the folder: `data_version` is the DVC hash, Delta's own versions are a convenience. `VACUUM` once a month removes files no longer referenced | Delta Lake, Python `deltalake` 1.6.6 (delta-rs, no Spark) | Delta tables on S3, queried by Athena | BigLake Delta tables on Cloud Storage | Delta tables on ADLS Gen2 (Microsoft Fabric) |
+| Database | One server, one database per owner: `airflow` (Airflow metadata), `mlflow` (MLflow backend store), `news` (Feast online store, `predictions` and `monitoring_metrics` tables). Separate databases because Airflow and MLflow both keep their schema version in an `alembic_version` table, and so each tool has its own user and backup | PostgreSQL 16 | Amazon RDS | Cloud SQL | Azure Database for PostgreSQL |
+| Orchestrator | DAGs `guardian_ingest_daily` (tasks `fetch` (one `last-modified` request for day D; skipped if the partition exists), `check_takedowns` (Mondays only), `validate_batch`, `clean_transform`, `dvc_snapshot`, `build_features`, `materialize`), `score_batch_daily`, `monitor_daily`, `train_classifier` | Apache Airflow 3.3.1, LocalExecutor | Amazon MWAA | Cloud Composer | Apache Airflow job in Microsoft Fabric (Data Factory's managed Airflow is closed to new instances, see 6.7) |
 | Tracking and registry | Runs, metrics, lineage tags; model `news-section-classifier` with aliases | MLflow 3.16.1 (PostgreSQL backend, MinIO artifacts) | SageMaker with MLflow | Vertex AI Experiments and Model Registry | Azure ML with MLflow |
-| Feature store | Feature views `contributor_stats`, `office_stats`; feature service `section_classifier_v1` | Feast 0.66.0 (offline: Parquet in MinIO; online: PostgreSQL) | SageMaker Feature Store | Vertex AI Feature Store | Azure ML managed feature store |
-| Model service | `classifier-api`: FastAPI, loads `@champion`, serves `POST /classify`, `/health`, `/ready`, `/metrics` | Container on Minikube | Amazon EKS | GKE | AKS |
+| Feature store | Feature views `contributor_stats`, `office_stats`; feature service `section_classifier_v1` | Feast 0.66.0 (offline: Parquet in `data/features`; online: PostgreSQL) | SageMaker Feature Store | Vertex AI Feature Store | Azure ML managed feature store |
+| Model service | `classifier-api`: FastAPI, loads `@champion`, serves `POST /v1/classify`, `/health`, `/ready`, `/metrics` | Container on Minikube | Amazon EKS | GKE | AKS |
 | Container registry | Images of `classifier-api` tagged with the commit | Minikube built-in registry | Amazon ECR | Artifact Registry | Azure Container Registry |
-| Kubernetes cluster | Runs serving and monitoring in Lab 4 | Minikube 1.33.1 (Kubernetes 1.30.0, docker driver, 4 GB) | Amazon EKS | GKE | AKS |
-| Model and data monitoring | Text, prediction and label drift reports | Evidently | SageMaker Model Monitor | Vertex AI Model Monitoring | Azure ML model monitoring |
-| Metrics and dashboards | Latency, throughput, freshness, alerts | Prometheus, Grafana | Amazon CloudWatch | Cloud Monitoring | Azure Monitor |
+| Message broker | Topic `articles.new`: new articles from `guardian-poller` to `cms-client` | Apache Kafka 4.3.1, one broker in KRaft mode, on Minikube | Amazon MSK | Google Cloud Managed Service for Apache Kafka | Azure Event Hubs (Kafka endpoint) |
+| Stream producer | `guardian-poller`: polls the Guardian API every 5 min, publishes new articles | Python container on Minikube | Pod on EKS | Pod on GKE | Pod on AKS |
+| Kubernetes cluster | Runs serving, the stream and monitoring in Lab 4 | Minikube 1.33.1 (Kubernetes 1.30.0, docker driver, 4 GB) | Amazon EKS | GKE | AKS |
+| Model and data monitoring | Text, prediction and label drift reports, run inside `monitor_daily`; numbers to `monitoring_metrics`, HTML reports to MLflow | Evidently (Python library) | SageMaker Model Monitor | Vertex AI Model Monitoring | Azure ML model monitoring |
+| Metrics and dashboards | Prometheus scrapes `classifier-api` (latency, throughput, fallback), `guardian-poller` (last successful poll) and `cms-client` (consumer lag); Grafana reads Prometheus and the `monitoring_metrics` table, shows dashboards and sends all alerts | Prometheus, Grafana | Amazon CloudWatch | Cloud Monitoring | Azure Monitor |
 | Local runtime | Runs the Lab 2 services together | Docker Desktop + Docker Compose | — (replaced by the managed services above) | — | — |
 | Code and CI | Repository, lint CI (tests from Lab 2) | GitHub + GitHub Actions | GitHub Actions (same) | GitHub Actions (same) | GitHub Actions (same) |
 | External data source | Articles and labels | The Guardian Open Platform Content API | — | — | — |
-| Consumer emulator | Replays new articles to `POST /classify` | `cms-client` Python script | — | — | — |
+| Consumer emulator | Consumes `articles.new` and calls `POST /v1/classify` for each article, as the CMS would | `cms-client` Python container on Minikube | Pod on EKS | Pod on GKE | Pod on AKS |
 
-Lab 1 runs nothing but CI. Lab 2 starts MinIO, PostgreSQL, Airflow, MLflow and Feast with Docker Compose; Lab 4 moves serving and monitoring to Minikube. Lab 3 adds a vector store (pgvector or Qdrant) and an LLM; this table is revised then.
+Lab 1 runs nothing but CI. Lab 2 starts MinIO, PostgreSQL, Airflow, MLflow and Feast with Docker Compose; Lab 4 moves serving and monitoring to Minikube and adds the stream (Kafka, `guardian-poller`, `cms-client`). Lab 3 adds a vector store (pgvector or Qdrant) and an LLM; this table is revised then.
 
 ### 6.3 Performance
 
@@ -426,18 +480,24 @@ Lab 1 runs nothing but CI. Lab 2 starts MinIO, PostgreSQL, Airflow, MLflow and F
 |---|---|---|
 | Online throughput | 1 req/s sustained, 5 req/s burst | Assumption: ~250 articles/day, peaks ~30/hour; editors may re-request on edits |
 | Online latency | p95 ≤ 300 ms, p99 ≤ 800 ms end to end | TF-IDF + linear model ≈ few ms; online store lookup ≈ 10–20 ms; rest is network and JSON |
-| Batch scoring | One day (~250 articles) ≤ 10 min, finished by 06:00 UTC | Runs after ingestion and materialisation |
+| Batch scoring | One day (~250 articles) ≤ 10 min, finished by 07:00 UTC | Runs after `guardian_ingest_daily` (materialisation at 06:00) |
 | Training | ≤ 30 min on 4 CPU cores | ~180k training articles, sparse linear model |
-| Ingestion | ≤ 3 API calls/day steady state; backfill ≤ 400 calls/day | Rate-limit headroom (4, cost row) |
+| Ingestion | Batch ≤ 3 API calls/day; takedown check ~35 calls/week; poller 288 calls/day; backfill ≤ 400 calls/day with the poller stopped | Rate-limit headroom (4, cost row) |
+| Stream | ~250 messages/day, ≤ 50 per poll; publication → online prediction p95 ≤ 10 min | 5 min poll interval; one partition, one consumer |
 | Storage | Raw ≤ 5 GB, clean Parquet ≤ 1 GB | Assumption: ~10 KB raw JSON per article incl. tags |
 
-**Batch versus online: online for the consumer, batch for monitoring.**
+**Batch versus online versus stream: online for the consumer, a stream to feed it, batch for everything else.**
 - **Online.** The editorial desk needs the suggestion while the editor is filing the article, so a nightly batch would arrive too late. This is the only path an external consumer uses.
 - **Batch.** A daily batch serves the system itself, not a consumer. It is needed for three reasons:
   - `classifier-api` only sees the articles the CMS sends. The batch scores every article of the day with one model version, so drift and quality metrics (6.6) cover all of them.
   - The champion/challenger comparison (5.4) needs both models scored on the same window, which is a batch job by nature.
   - Lab 4 emulates drift by replaying whole months (2026-07 → 2026-09). Batch-scoring the replayed days does this without pushing thousands of requests through the API.
-- Both paths load the same `@champion` and the same Feast feature service, so they cannot diverge.
+- **Stream.** The Guardian API cannot push articles to us, so `guardian-poller` polls it and turns new articles into a stream on Kafka. Kafka sits between the poller and the API for three reasons:
+  - if `classifier-api` is down or being restarted, articles wait in the topic instead of being lost or polled again;
+  - consumer lag is a direct, label-free measure of whether the online path keeps up (6.6);
+  - a past month can be replayed into the same topic (`guardian-poller --replay`, reading `data/clean`) to demo the online path without live API calls.
+- **What the stream does not do.** It does not compute features or labels. Labels count only after 24 h and features change once a day (5.3), so a faster path would not change any prediction; this is why stream processing is out of scope (7.1).
+- Both inference paths load the same `@champion` and the same Feast feature service, so they cannot diverge.
 
 ### 6.4 Security
 
@@ -445,16 +505,17 @@ Lab 1 runs nothing but CI. Lab 2 starts MinIO, PostgreSQL, Airflow, MLflow and F
   - `GUARDIAN_API_KEY`, MinIO and PostgreSQL credentials live in `.env`, which is git-ignored; `.env.example` with empty values is committed.
   - Airflow reads them as connections and variables; in Lab 4 they become Kubernetes Secrets.
   - CI needs no secrets in Lab 1. If later CI jobs need the Guardian key, it goes into GitHub Actions Secrets, never into a workflow file.
-- **Who may call the service.** `classifier-api` is reachable only inside the Minikube cluster and through `kubectl port-forward`. Assumption: a static bearer token for `POST /classify` (from a Kubernetes Secret) is enough for the course. `/health` and `/metrics` stay unauthenticated inside the cluster.
+- **Who may call the service.** `classifier-api` is reachable only inside the Minikube cluster and through `kubectl port-forward`. Assumption: a static bearer token for `POST /v1/classify` (from a Kubernetes Secret) is enough for the course. `/health` and `/metrics` stay unauthenticated inside the cluster.
+- **Kafka.** The broker is reachable only inside the cluster. Assumption: no authentication on the listener for the course; on a managed service it would use IAM or SASL. `guardian-poller` reads `GUARDIAN_API_KEY` from a Kubernetes Secret.
 - **Supply chain.** Dependencies are pinned in `uv.lock`; images are tagged with the commit hash; ruff runs in pre-commit and CI.
-- **Guardian key protection.** Requests stay under the daily limit (4); on HTTP 403/429 the DAG backs off and alerts instead of retrying in a loop.
+- **Guardian key protection.** Requests stay under the daily limit (4); on HTTP 403/429 the DAG and the poller back off and alert instead of retrying in a loop.
 
 ### 6.5 Data privacy
 
 - **Personal data in the dataset.** Article texts are public journalism but mention named people. Bylines and contributor tags identify journalists, and the contributor id is used as a feature-store entity. No reader data, user accounts or behaviour logs are collected.
 - **Minimisation.** Only the fields listed in 5.2 are requested; contributor emails, Twitter handles and bios in tag objects are dropped in the clean layer.
-- **Retention.** Raw responses are kept for the course duration plus 3 months, then deleted. Assumption: storing article text for non-commercial research is within the Open Platform terms; to be confirmed when the key is issued. Feature-store rows keep only aggregates (counts and shares), not text.
-- **Takedowns.** The weekly `last-modified` sweep checks `isGone` / `isExpired`. Removed articles are deleted from raw and clean and excluded from future training snapshots.
+- **Retention.** Raw responses are kept for the course duration plus 3 months, then deleted. Assumption: storing article text for non-commercial research is within the Open Platform terms; to be confirmed when the key is issued. Feature-store rows keep only aggregates (counts and shares), not text. Messages in `articles.new` are deleted after 7 days (topic retention).
+- **Takedowns.** A removed article disappears from the API. The task `check_takedowns` of `guardian_ingest_daily` runs on Mondays only and asks `/search?ids=…` for the ids stored in the last 7 days, 50 ids per call (~35 calls); an id missing from the response is treated as taken down (checked on 2026-10-25: unknown ids are simply left out). Assumption: takedowns older than 7 days are handled on request. Removed articles are deleted from raw and from `clean/articles` (Delta `DELETE`, then `VACUUM` so the files are really gone) and excluded from future training snapshots: a removal outranks reproducibility. Older DVC versions in MinIO still hold the article until the retention limit.
 - **No redistribution.** Raw and clean data never go into the Git repository or a public bucket; the DVC remote is a private MinIO bucket.
 
 ### 6.6 Monitoring and alarms
@@ -462,26 +523,33 @@ Lab 1 runs nothing but CI. Lab 2 starts MinIO, PostgreSQL, Airflow, MLflow and F
 First draft; Lab 4 makes it real.
 
 **What is logged.**
-- Every online and batch prediction to `predictions`: `article_id`, `model_version`, `section`, `confidence`, `top3`, `fallback_used`, `latency_ms`, `request_ts`.
-- Request metrics to Prometheus.
-- Pipeline task outcomes and row counts from Airflow.
+- Every online and batch prediction to `predictions`: `article_id`, `source` (`online` or `batch`), `model_version`, `sections`, `main_section`, `scores`, `top3`, `fallback_used`, `latency_ms`, `request_ts`.
+- Request metrics of `classifier-api`, the last successful poll of `guardian-poller` and the consumer lag of `cms-client` to Prometheus.
+- Pipeline results (quality gate outcome, row counts, newest article timestamp) and the daily drift and quality numbers of `monitor_daily` to the PostgreSQL table `monitoring_metrics`. Grafana alert rules read both sources.
+
+**Which predictions each metric uses.** The business metrics (acceptance rate, top-3 coverage) use the `online` rows: they measure what editors were actually shown. Drift, sections per article, confidence and macro-F1 use the `batch` rows, which cover every article of the day with one model version.
 
 **Metrics and thresholds.**
 
 | Signal | Metric | Threshold | Window | Alert to |
 |---|---|---|---|---|
 | Freshness | Age of the newest article in clean / online store | > 30 h | checked hourly | On-call ML engineer (e-mail) |
-| Volume | Articles ingested for day D vs median of the previous 28 days | < 50% or > 200% | daily | On-call |
-| **Stale partition** | Ingested `max(webPublicationDate)` ≠ the run's logical date `ds` (the job read an old partition while "succeeding") | any mismatch | daily | On-call |
+| Volume | Articles in raw partition D (last modified on D) vs median of the previous 28 days | < 50% or > 200% | daily | On-call |
+| **Stale partition** | Date of the ingested `max(webPublicationDate)` ≠ the run's target day (logical date − 1, 5.2): the job read an old partition while "succeeding" | any mismatch | daily | On-call |
 | Quality gate | `validate_batch` failed | any failure | per run | On-call |
 | Unmapped sections | Share of `other` / unmapped `sectionId` | > 5% | daily | On-call; model owner updates the section map |
 | Prediction drift | Jensen–Shannon distance of the predicted-class distribution vs the reference (training) window | > 0.1 | 7-day rolling | On-call |
 | Input drift | Evidently text-drift test on TF-IDF features vs reference | drift detected | 7-day rolling | On-call |
-| Confidence | Share of predictions with confidence < 0.5 | > 25% | daily | On-call |
+| Sections per article | Mean number of predicted sections vs the reference window | change > 30% | 7-day rolling | On-call |
+| Confidence | Share of predictions whose main-section probability is < 0.5 | > 25% | daily | On-call |
+| Late label changes | Share of a day's articles with a row in `late_label_changes` (label set changed more than 24 h after publication) | > 2% | 7-day rolling | Model owner: widen the 24 h window in `training_rows` (2) |
 | Quality (after labels) | Macro-F1 of the last 7 labelled days | < 0.75 or drop > 0.05 from test score | daily | On-call → triggers `train_classifier` |
 | Fallback use | Share of `fallback_used = true` | > 1% | 1 h | On-call |
 | Service | p95 latency; 5xx rate | > 300 ms; > 1% | 5 min | On-call |
-| API limits | Guardian HTTP 403/429 responses | any | per run | On-call |
+| API limits | Guardian HTTP 403/429 responses | any | per run / per poll | On-call |
+| Poller stalled | Time since the last successful poll of `guardian-poller` | > 15 min | checked every 5 min | On-call |
+| Consumer lag | Messages in `articles.new` not yet processed by `cms-client` | > 50, or oldest unprocessed > 15 min | 5 min | On-call |
+| Stream completeness | Share of the target day's batch-ingested articles that have an `online` prediction | < 95% | daily | On-call |
 
 **Who receives alerts.** Grafana alerting sends an e-mail to the on-call ML engineer (the repository owner). Retraining is triggered automatically by the quality rule; promotion still needs approval (5.5).
 
@@ -528,6 +596,8 @@ First draft; Lab 4 makes it real.
 
 Azure without Airflow: replacing the Fabric line with Data Factory pipelines, billed per activity run ($3.55), gives **$311.84/month** ([`cost/azure-estimate-adf.png`](cost/azure-estimate-adf.png)). It is not like-for-like: every Airflow DAG would be rewritten as a Data Factory pipeline.
 
+**Kafka is not in the totals yet.** The stream (F9) was added after the calculator estimates of 2026-10-20. Assumption: the smallest managed option on each cloud (Amazon MSK, Google Cloud Managed Service for Apache Kafka, Azure Event Hubs Standard with one throughput unit) is priced in the three calculators and added as one more line in Lab 4. `guardian-poller` and `cms-client` are small pods on the existing nodes and cost nothing extra. In the self-hosted variant below, Kafka runs as one more pod on the cluster, also at no extra charge.
+
 **What the numbers say.**
 - **The model itself is almost free.**
   - Training and drift jobs cost under $5/month in every cloud, and storage is under $1.
@@ -568,7 +638,7 @@ Azure without Airflow: replacing the Fabric line with Data Factory pipelines, bi
 
 | Calculator line | Plan entered | What it does in our system | Why this plan | USD/month |
 |---|---|---|---|---|
-| Amazon RDS for PostgreSQL, `mlops-postgres` | db.t4g.small, Single-AZ, 20 GB general-purpose SSD | One database for Airflow metadata, the MLflow backend, the Feast online store and the `predictions` table | Smallest burstable class: the load is a few hundred writes a day. Single-AZ because high availability is out of scope (assumptions above) | 29.75 |
+| Amazon RDS for PostgreSQL, `mlops-postgres` | db.t4g.small, Single-AZ, 20 GB general-purpose SSD | One instance with separate databases `airflow` (Airflow metadata), `mlflow` (MLflow backend) and `news` (Feast online store, `predictions`, `monitoring_metrics`), as in 6.2 | Smallest burstable class: the load is a few hundred writes a day. Single-AZ because high availability is out of scope (assumptions above) | 29.75 |
 | Amazon S3, `mlops-lake` | S3 Standard, 20 GB, PUT and GET requests | Raw JSON, clean and feature Parquet, MLflow artifacts, DVC remote | Standard class, because training and drift jobs read the data every day. 20 GB covers the 5 GB raw ceiling plus derived layers and artifacts | 0.85 |
 | Amazon MWAA, `mlops-airflow` | Small environment, minimum 1 worker, 730 h | Runs the DAGs `guardian_ingest_daily`, `score_batch_daily`, `monitor_daily`, `train_classifier` | Smallest environment class. Four DAGs that run for minutes a day need no more. The environment cannot be stopped, so it is billed 24/7 | 357.80 |
 | Amazon EKS, `mlops-eks` | 1 cluster, standard support | Kubernetes control plane for `classifier-api` and monitoring (Lab 4) | One cluster for one environment | 73.00 |
@@ -587,7 +657,7 @@ Azure without Airflow: replacing the Fabric line with Data Factory pipelines, bi
 | Managed Airflow Gen 3 (formerly Cloud Composer) | Small environment; 1 scheduler, 1 worker, 1 web server, 1 triggerer, 1 DAG processor; 730 h | Runs the four Airflow DAGs | Smallest environment size, not highly resilient | 406.95 |
 | Feature Store (listed under "Agent Platform") | Optimized online serving, 1 node, 730 h | Serves `contributor_stats` and `office_stats` to `classifier-api` at request time | Online serving needs at least one node running 24/7. The offline store lives in Cloud Storage, already counted | 255.50 |
 | GKE (Kubernetes Engine) | 1 zonal cluster; 2 × e2-standard-2 (2 vCPU, 8 GB); 30 GB balanced boot disk; regular provisioning | Runs `classifier-api`, monitoring, the MLflow server (no managed MLflow on Google Cloud) and the daily drift job | Zonal cluster, because multi-zone HA is out of scope. Node size matches the other clouds | 206.25 |
-| PostgreSQL (Cloud SQL) | Enterprise edition, db-g1-small (1 vCPU, 1.7 GB), 20 GB SSD, no HA | Same shared database as on AWS | Smallest shared-core instance that fits four light workloads | 34.74 |
+| PostgreSQL (Cloud SQL) | Enterprise edition, db-g1-small (1 vCPU, 1.7 GB), 20 GB SSD, no HA | Same shared instance and databases as on AWS | Smallest shared-core instance that fits four light workloads | 34.74 |
 | Cloud Load Balancing | Regional, 1 forwarding rule, 1 proxy instance, ~1 GB processed | HTTPS entry point to `classifier-api` | Regional, because all users and services are in one region | 40.18 |
 | Artifact Registry | 10 GB, Europe | Images of `classifier-api` | Same image history as on AWS | 0.95 |
 | Cloud Storage | Standard, regional europe-west3, 20 GB, 0.2 million Class B operations | Data lake, MLflow artifacts, DVC remote, Feature Store offline data | Standard class for data read daily; regional, next to the compute | 0.75 |
@@ -601,7 +671,7 @@ Azure without Airflow: replacing the Fabric line with Data Factory pipelines, bi
 | Calculator line | Plan entered | What it does in our system | Why this plan | USD/month |
 |---|---|---|---|---|
 | Microsoft Fabric, `mlops-airflow` | F8 capacity (8 CU), pay-as-you-go, 730 h | Hosts the Apache Airflow job (small custom pool) that runs the four DAGs | The only managed Airflow on Azure today. A small always-on pool uses 5 CU, and Microsoft names F8 as its minimum capacity, so F4 (4 CU) would be too small | 1,284.80 |
-| Azure Database for PostgreSQL, `mlops-postgres` | Flexible Server, Burstable B1ms (1 vCore), 32 GiB Premium SSD, LRS | Same shared database as on AWS | Smallest burstable size. 32 GiB is the smallest disk the service offers | 18.91 |
+| Azure Database for PostgreSQL, `mlops-postgres` | Flexible Server, Burstable B1ms (1 vCore), 32 GiB Premium SSD, LRS | Same shared instance and databases as on AWS | Smallest burstable size. 32 GiB is the smallest disk the service offers | 18.91 |
 | Storage Accounts, `mlops-lake` | Block blob, General Purpose v2, Hot tier, LRS, 20 GB, about 270k operations | Data lake, MLflow artifacts, DVC remote, offline feature store | Hot tier, because the data is read daily; LRS, because the data can be re-collected from the Guardian API | 0.81 |
 | Azure Kubernetes Service, `mlops-aks` | Standard tier (with SLA), 1 cluster; 2 × D2s v5 (2 vCPU, 8 GB); 2 × E4 managed disks | Runs `classifier-api` and monitoring (Lab 4) | Standard tier, so the control plane has an uptime SLA, as on EKS and GKE. Node size matches the other clouds | 245.70 |
 | Azure Machine Learning, `mlops-aml-jobs` | D4s v3 (4 vCPU, 16 GB), 10 h pay-as-you-go | Weekly training (4 × 0.5 h) and the daily drift job (30 × 0.25 h); the workspace also provides MLflow tracking and the model registry at no charge | Compute is billed only while jobs run. 9.5 h of jobs rounded up to 10 h | 2.30 |
@@ -616,11 +686,13 @@ Without Airflow, Azure costs $311.84/month: the Fabric line is replaced by Data 
 
 | Party | Direction | Owner | Contract |
 |---|---|---|---|
-| Guardian Content API | Upstream (data and labels) | Guardian News & Media | REST/JSON over HTTPS; fields and tag types as in the public content model; developer key, non-commercial terms. Rate limit: Assumption 500 calls/day and 1 call/s until measured from response headers. Schema changes are not announced to us, so `validate_batch` checks the schema on every batch (6.9). |
-| Editorial desk / CMS (`cms-client`) | Downstream (online) | Project (emulated) | `POST /classify`, JSON in `{headline, standfirst, body_text, contributor_ids, production_office, published_at}`, JSON out `{section, confidence, top3, model_version, fallback_used}`. p95 ≤ 300 ms. Unknown fields ignored. On errors the client keeps the editor's manual choice. The API is versioned by path (`/v1/`). |
+| Guardian Content API | Upstream (data and labels) | Guardian News & Media | REST/JSON over HTTPS; fields and tag types as in the public content model; developer key, non-commercial terms. Rate limit: 500 calls/day and 60 calls/min, measured from the response headers `x-ratelimit-limit-day` and `x-ratelimit-limit-minute` (2026-10-25). Schema changes are not announced to us, so `validate_batch` checks the schema on every batch (6.9). |
+| Editorial desk / CMS (`cms-client`) | Downstream (online) | Project (emulated) | `POST /v1/classify`, JSON in `{article_id, headline, standfirst, body_text, contributor_ids, production_office, tone, published_at}` (`article_id` is the Guardian id, used to join the prediction with its label later), JSON out `{sections, main_section, scores, top3, model_version, fallback_used}`; `sections` is never empty. p95 ≤ 300 ms. Unknown fields ignored. On errors the client keeps the editor's manual choice. The API is versioned by path (`/v1/`). |
 | On-call ML engineer | Downstream (alerts) | Repository owner | E-mail from Grafana with the rule name, current value, threshold and a link to the dashboard or Evidently report. |
 
-**Internal contract: the `predictions` table.** No external party reads it, but `monitor_daily` and the champion/challenger comparison depend on it. It has one row per article per model version and is complete for day D by 06:00 UTC on D+1. Columns are only added, never renamed; a rename needs a new table version.
+**Internal contract: the Kafka topic `articles.new`.** One JSON message per new article, key = `article_id`, value = the request body of `POST /v1/classify` (`{article_id, headline, standfirst, body_text, contributor_ids, production_office, tone, published_at}`) plus `polled_at`. Delivery is at least once: a duplicate message only overwrites the same `predictions` row (`article_id`, `model_version`, `source`). Fields are only added, never renamed. One partition, 7-day retention.
+
+**Internal contract: the `predictions` table.** No external party reads it, but `monitor_daily` and the champion/challenger comparison depend on it. It has one row per article, model version and `source` (`online`, `batch`); the batch rows for day D are complete by 07:00 UTC on D+1. Columns are only added, never renamed; a rename needs a new table version.
 
 ### 6.9 Risks and uncertainties
 
@@ -632,9 +704,13 @@ Without Airflow, Azure costs $311.84/month: the Fabric line is replaced by Data 
 | Label leakage through URL, ids, keyword or series tags | High if unchecked / high | Leaking fields dropped in `clean_transform`; a unit test asserts that no feature column is derived from them |
 | Concept drift (new events, news cycles) | High / medium | Daily drift and quality monitoring, weekly retraining, champion/challenger gate |
 | Class imbalance (sport and world dominate) | High / medium | Macro-F1 as the optimizing metric, class weights, per-class recall floor |
-| Guardian terms on storing content | Low–medium / high | Non-commercial student use (confirmed by Guardian staff); private storage only; retention limit; takedown sweep |
+| Guardian terms on storing content | Low–medium / high | Non-commercial student use (confirmed by Guardian staff); private storage only; retention limit; weekly takedown check |
 | Local resources (8 GB RAM) too small for the full stack | Medium / medium | Services started per lab; Minikube capped at 4 GB; training on a sample if needed |
 | Guardian API outage during the demo | Low / medium | Serving does not depend on the Guardian API; replayed production months give a deterministic demo |
+| Additional sections from keyword tags are noisy (tags applied inconsistently) | Medium / medium | Lab 2 measures labels per article and per-class agreement; the rule can require 2 tags per section; the acceptance rate depends only on the main section |
+| Stream misses or duplicates articles (late appearance in the API, poller restart) | Medium / low | 10-minute overlap between polls; ids already sent are skipped; duplicates only overwrite the same `predictions` row; the daily stream-completeness check compares the stream with the batch, which stays the source of truth |
+| Polling uses most of the Guardian call budget (288 of 400/day) | Medium / medium | Poll interval is a setting (10 min halves the use); the backfill runs with the poller stopped; HTTP 429 stops polling and alerts |
+| Editors move articles more than 24 h after publication, so some labels are not the final section | Low–medium / medium | Every version is kept; `late_label_changes` counts them; alert above 2%; widening the window is a one-parameter change in a view, with no data rewritten |
 | Contributor features are sparse for new or rare authors | High / low | Global prior as default; features added only if they improve macro-F1 on validation |
 
 ---
@@ -647,9 +723,15 @@ Without Airflow, Azure costs $311.84/month: the Fabric line is replaced by Data 
 |---|---|---|---|
 | **BBC News All-Time** (Hugging Face, monthly Parquet 2017–2025) instead of the Guardian API | No key, one file per month, full text | Frozen since 2025-06-28; ~30% duplicate rows; `authors` empty; 64–129 mostly geographic sections, 7–19% missing; no licence stated | Rejected as primary; kept as fallback (6.9) |
 | **HuffPost News Category** (209k articles, 2012–2022, CC BY 4.0) | Open licence, measured drift, single file | Headline + ~20-word description only; volume drops ~15× after May 2018; no new data | Rejected: too little text for Lab 3, no live collection |
-| **Multi-label keyword-tag classification** | Richer output, closer to Guardian tagging | Tag ids leak the section; thousands of long-tail labels; hard to evaluate | Rejected (5.1) |
+| **Single-label classification** (main section only) | Simplest metrics and output | Ignores that articles span sections; a correct second section counts as an error | Rejected (5.1): multi-label with at least one section chosen |
+| **Per-tag classification over Guardian keyword tags** | Richer output, closer to Guardian tagging | Thousands of long-tail labels; hard to evaluate | Rejected (5.1); tags only give the additional sections |
 | **Fine-tuned transformer** (e.g., DistilBERT) instead of TF-IDF + logistic regression | Usually higher accuracy on text | GPU or slow CPU training; larger image; harder to reproduce; model quality is not graded | Deferred: candidate for a later challenger if time allows |
-| **Streaming ingestion** (Kafka + Spark) instead of daily batches | Lower latency to ingest | ~250 articles/day does not need streaming; much more infrastructure | Rejected: daily batch meets the freshness requirement |
+| **Full streaming pipeline** (Kafka + Spark or Flink computing features and labels from the stream) instead of daily batches | Features updated within minutes | Labels count only after 24 h and features change daily, so fresher data changes no prediction; ~250 articles/day; much more infrastructure | Rejected: Kafka is used only to deliver new articles to the online path (6.3); features, labels and training stay daily batch |
+| **No broker**: `cms-client` polls the Guardian API and calls `classifier-api` directly | One service and one Kafka broker fewer | Articles are lost or must be polled again while the API is down; no consumer lag to monitor; no replay into the online path | Rejected: Kafka chosen for buffering, lag monitoring and replay (6.3) |
+| **Plain Parquet partitioned by date, last 3 partitions rebuilt by every run** (lookback overwrite) | No table format | Each partition is written by three runs, so its content depends on which run ran last; a rerun of an old interval can overwrite a newer label with an older one | Rejected: Delta `MERGE` into one SCD type 2 table (5.2) |
+| **Day request plus a 3-day `last-modified` sweep** (`use-date=published` for D, then everything changed in the last 3 days) | Raw partition D holds exactly the articles published on D | Two requests and two kinds of files; most articles arrive twice (a day file and a sweep file); up to 6 calls/day; the sweep is the only part that sees changes anyway | Rejected: one `last-modified` request per day sees new and changed articles alike (5.2) |
+| **Separate labels table** (append-only label versions in Parquet, with views computing `valid_to`) | Works on plain Parquet | Two tables for one article; `valid_to` recomputed on every read; three views to explain | Rejected: with Delta `MERGE` the article and all its versions live in one table |
+| **One label row per article, written once by a later run** (a label snapshot 27–51 h after publication) | Simple join | No history; the 24 h rule becomes 27–51 h; changing the window means rebuilding from raw | Rejected: SCD type 2 keeps every version, and the label is the row valid at 24 h |
 | **No feature store** (all features computed from the request) | Simpler | No point-in-time history features; skew risk if history features are later added ad hoc | Rejected: Feast gives contributor and office features with one definition for training and serving |
 
 ### 7.2 Experiment results
@@ -664,7 +746,7 @@ Placeholder. Filled in Lab 4: measured latency and throughput of `classifier-api
 
 | Lab | What it adds to this system |
 |---|---|
-| Lab 2 | Docker Compose stack (MinIO, PostgreSQL, Airflow, MLflow, Feast); `guardian_ingest_daily` with `validate_batch` and DVC snapshots; clean layer and section map; `contributor_stats` / `office_stats` feature views; keyword baseline and TF-IDF model trained on the time-based split, tracked and registered in MLflow with data version and commit; tests in CI. |
+| Lab 2 | Docker Compose stack (MinIO, PostgreSQL, Airflow, MLflow, Feast); `guardian_ingest_daily` with `validate_batch` and DVC snapshots; clean Delta table `clean/articles` (SCD type 2) and `sql/articles.sql`, section map; `contributor_stats` / `office_stats` feature views; keyword baseline and TF-IDF model trained on the time-based split, tracked and registered in MLflow with data version and commit; tests in CI. |
 | Lab 3 | An LLM component over the Guardian full-text corpus: retrieval of similar past articles (pgvector or Qdrant) to explain a suggested section and answer editors' questions about recent coverage, with a retrieval and answer evaluation set and versioned prompts. |
-| Lab 4 | `classifier-api` and monitoring on Minikube with health and readiness probes; `score_batch_daily` and `monitor_daily`; Evidently reports and Grafana dashboards; an injected drift (replay of a month with a shifted section mix) crossing a threshold and reaching the on-call e-mail; one command to bring the system up. |
-| Lab 5 | An agent that uses the system: pulls the day's articles through the Guardian API, calls `/classify`, explains low-confidence cases with the Lab 3 retrieval, and drafts a daily topic-volume brief, with traces and a 10-task evaluation. |
+| Lab 4 | `classifier-api` and monitoring on Minikube with health and readiness probes; the stream of new articles (Kafka, `guardian-poller`, `cms-client`) feeding the API, with consumer-lag alerts; `score_batch_daily` and `monitor_daily`; Evidently reports and Grafana dashboards; an injected drift (replay of a month with a shifted section mix) crossing a threshold and reaching the on-call e-mail; one command to bring the system up. |
+| Lab 5 | An agent that uses the system: pulls the day's articles through the Guardian API, calls `/v1/classify`, explains low-confidence cases with the Lab 3 retrieval, and drafts a daily topic-volume brief, with traces and a 10-task evaluation. |
