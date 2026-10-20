@@ -21,12 +21,43 @@ Newsrooms file every article under a section (politics, business, sport, culture
 ## 2 Motivation
 
 **Who consumes the predictions.**
-- *Editorial desk (primary).* When an article is ready, the CMS asks the system for a suggested section and shows the top 3 to the editor. In this project the CMS is emulated by a client script (`cms-client`) that replays newly published Guardian articles.
-- *Newsroom analytics (secondary).* A daily table of predicted sections for all articles of the previous day, used for topic-volume reports and for monitoring.
+- *Editorial desk, the only external consumer.* When an article is ready, the CMS asks the system for a suggested section and shows the top 3 to the editor. In this project the CMS is emulated by a client script (`cms-client`) that replays newly published Guardian articles.
+- *Inside the system: monitoring.* A daily batch also scores every article of the previous day. Nobody outside the system reads it. It exists so that drift and quality monitoring (6.6) and the champion/challenger comparison (5.4) see all articles, not only those the CMS sent.
 
 **How often.** Continuously during the day, one request per new article. Assumption: ~250 articles/day, to be confirmed by `response.total` of the first API call (see 5.2).
 
 **What happens when a prediction is wrong.** The editor corrects the section by hand (Assumption: ~30 s per correction). If nobody notices, the article lands on the wrong section front and in the wrong newsletter, and loses audience. A wrong suggestion is cheap one at a time but expensive when it is systematic, for example when a new topic appears and the model keeps sending it to `world`.
+
+**User stories.**
+
+| # | As a… | I want… | So that… | Where in the design |
+|---|---|---|---|---|
+| U1 | Editor filing an article | to see a suggested section and the top 3 alternatives within a moment of pressing "suggest" | I can file the article in one click instead of choosing from the full section list | F6, `POST /classify`, p95 ≤ 300 ms |
+| U2 | Editor | to pick a different section when the suggestion is wrong | the article lands on the right section front; my choice becomes the correct answer (the label) the system learns from | 5.5, override |
+| U3 | Editor | to move an article to another section during its first day if the story develops | the section reflects what the article turned out to be about | 5.2, 24 h label delay |
+| U4 | Editor | the CMS to keep working if the model is down | publishing is never blocked by the classifier | 4, availability and fallback |
+| U5 | On-call ML engineer | an alert when the model starts going wrong, **before** the correct sections are known | I can react the same day instead of waiting for the quality numbers | 6.6, label-free signals |
+| U6 | On-call ML engineer | daily macro-F1 and acceptance rate once the correct sections are known | I know whether the early alert was a real problem or a news-cycle spike | 6.6, quality after labels |
+| U7 | Model owner | to compare a retrained model with the current one on the same recent articles, and promote it by hand | a new model replaces the old one only when it is really better | 5.4, 5.5 |
+| U8 | Model owner | to map a new Guardian section to a project class | new sections are not silently lumped into `other` | 5.5, section map |
+
+**Example: one article through the system, and why the label is delayed 24 h.**
+
+| When (UTC) | What happens | What the system knows about the correct section |
+|---|---|---|
+| Day D, 09:40 | A journalist finishes "Heatwave closes schools across southern England". The CMS calls `POST /classify` and gets `environment` 0.62, `uk-news` 0.24, `world` 0.08. The prediction is logged to `predictions`. | Nothing yet. |
+| Day D, 09:41 | The editor accepts `environment` (U1). The article is published at 10:00, which becomes its `webPublicationDate`. | The editor's choice exists in the CMS, but it may still change. |
+| Day D, 15:00 | The story develops into a story about exam cancellations. The editor moves the article to `uk-news` (U3). | The section has changed. If the system had counted 09:41 as final, it would now hold a wrong label. |
+| Day D+1, 03:00 | `guardian_ingest_daily` downloads all articles of day D, this one included, with its current section `uk-news`. | The section is stored, but the article is only 17 h old, so it is **not used yet**. |
+| Day D+1, 10:00 | 24 h have passed since publication. | The section `uk-news` now counts as the **label**: final and safe to use. |
+| Day D+2, 06:00 | `monitor_daily` joins the logged prediction (`environment`) with the label (`uk-news`). The miss counts against macro-F1 and the acceptance rate (U6). The contributor's history features now include this article. | Used for quality metrics and features. |
+
+What the 24 h delay gives the design:
+1. **It matches how the newsroom works.** A section is final only when editors stop moving the article (U3). A label taken too early would be wrong whenever the section changed later.
+2. **It makes monitoring without labels a real phase.** For the first day after publication, the on-call engineer has only label-free signals: predicted-class mix, confidence, text drift and volume (U5). Labels confirm or dismiss those alerts later (U6). Without a delay, this part of the system would never be exercised, because the Guardian API returns the section together with the article.
+3. **It prevents leakage.** Contributor features may use only labels the system could actually have known at that moment. Otherwise training would see information that serving never has.
+
+Assumption: 24 h is the confirmation window. If the Guardian data shows articles changing section later than that (checked with the `last-modified` sweep in Lab 2), the window is extended.
 
 **Why a system and not a notebook.** News changes continuously: new events bring new vocabulary, sections are reorganised, the label mix shifts with the news cycle. A model trained once in a notebook degrades silently. During dataset selection, a TF-IDF + logistic regression baseline trained on 2014–2015 HuffPost headlines fell from macro-F1 0.617 (2016) to 0.465 (first half of 2018) with no code change. The value here is in the loop around the model: periodic collection, validation, versioning, monitoring for degradation, and retraining by trigger.
 
@@ -62,7 +93,7 @@ Macro-F1 is the optimizing metric because classes are imbalanced (sport and worl
 | F4 | Compute features per entity (contributor, production office) with event timestamps; publish them to the offline store and materialise the latest values to the online store. |
 | F5 | Train a baseline and a candidate model on a time-based split; log parameters, metrics, data version and commit; register the model. |
 | F6 | **Online inference.** `POST /classify` accepts `{headline, standfirst, body_text, contributor_ids[], production_office, published_at}` and returns `{section, confidence, top3[], model_version, fallback_used}`. Caller: the CMS (emulated by `cms-client`). |
-| F7 | **Batch inference.** Every day, score all articles of the previous day into the `predictions` table in PostgreSQL. Caller: Airflow; reader: newsroom analytics and monitoring. |
+| F7 | **Batch inference.** Every day, score all articles of the previous day into the `predictions` table in PostgreSQL. Caller: Airflow; readers: `monitor_daily` (drift and quality, 6.6) and the champion/challenger comparison (5.4). Internal only, no external consumer. |
 | F8 | Monitor inputs, predictions and (after the delay) labels; raise an alert when a threshold is crossed; trigger retraining. |
 
 ### Non-functional requirements
@@ -75,7 +106,7 @@ Macro-F1 is the optimizing metric because classes are imbalanced (sport and worl
 | **Reproducibility** | Any registered model can be rebuilt from its MLflow run: tags `git_commit`, `data_version` (DVC hash of the training snapshot), `section_map_version`, `feature_service`. `make setup` recreates the environment from `uv.lock`; `dvc pull` restores raw snapshots without a Guardian key. |
 | **Adaptability** | New data enters daily as a new date partition. New models enter through scheduled weekly retraining or a drift-triggered run, as `@challenger`, and replace `@champion` only through the promotion gate (5.4) and a human approval (5.5). New Guardian sections enter through the versioned section map; until mapped they go to `other`. |
 | **Observability without ground truth** | During the 24 h before labels arrive: predicted-class distribution vs the reference window, mean confidence and share of low-confidence predictions (< 0.5), text drift on TF-IDF features, share of `other` / unmapped sections, ingested volume per day, feature freshness. After labels: macro-F1 and acceptance rate per day and per 7-day window. |
-| **Cost and resource ceilings** | Local stack fits in 8 GB RAM and 4 CPU cores (Minikube 4 GB + host services). Training on CPU only, ≤ 30 min per run. Guardian API usage ≤ 400 calls/day, which keeps 20% headroom under the most restrictive reported developer limit (500/day). Raw storage ≤ 5 GB. Monthly cloud cost: see 6.7. |
+| **Cost and resource ceilings** | Local stack fits in 8 GB RAM and 4 CPU cores (Minikube 4 GB + host services). Training on CPU only, ≤ 30 min per run. Guardian API usage ≤ 400 calls/day, which keeps 20% headroom under the most restrictive reported developer limit (500/day). Raw storage ≤ 5 GB. Monthly cloud cost: $0 for the course (local); managed cloud ≈ $946–1,593/month, self-hosted variant ≈ $350–380/month (6.7). |
 
 ### In scope
 
@@ -143,7 +174,15 @@ Assumption: the mapping is final only after counting `sectionId` frequencies ove
 
 **Labels and their delay.**
 - The label is the editorial `sectionId`, mapped to the project class.
-- In reality it arrives with the article. To emulate an editor confirming the section later, the system treats the label as **unavailable for 24 h** after `webPublicationDate`. Monitoring and contributor features may use it only after that.
+- **The Guardian API gives the label immediately, but the system pretends it arrives 24 h later.**
+  - In the API, every article already comes with its `sectionId`, so technically the label is known right away.
+  - In a real newsroom the final section is confirmed by an editor some time after publication. To emulate this, the system treats the label as **unknown for the first 24 h** after `webPublicationDate`.
+  - This makes "monitoring without labels" (6.6) a real phase: for the first 24 h, only signals that need no label are available.
+  - A step-by-step example of one article, with the user stories behind the rule, is in 2 (Motivation).
+- **What the 24 h rule means in practice:**
+  - Quality metrics (macro-F1, acceptance rate) are computed only on articles published more than 24 h ago.
+  - Contributor and office history features (5.3) count only articles older than 24 h, so they never use a label the system should not know yet.
+  - The model never receives the label as an input; at serving time the section is what it predicts.
 - A label changes if the Guardian moves the article; the `last-modified` sweep records the change.
 
 **Available at serving time vs training time.**
@@ -255,7 +294,6 @@ flowchart LR
   SYS["Guardian news section classifier<br/>ingests, validates, trains,<br/>serves, monitors"]
   CMS["Editorial desk<br/>(CMS, emulated by cms-client)"] -->|"article at publication"| SYS
   SYS -->|"suggested section, top-3, confidence"| CMS
-  SYS -->|"daily predictions table"| AN["Newsroom analytics"]
   SYS -->|"drift and quality alerts by e-mail"| OC["On-call ML engineer"]
   OC -->|"promotion approval, rollback, section map"| SYS
 ```
@@ -331,7 +369,7 @@ flowchart TB
     subgraph COMPOSE["Docker Compose (Lab 2)"]
       MINIO["MinIO pgsty/silo<br/>→ S3 / Cloud Storage / Blob Storage"]
       PG["PostgreSQL 16<br/>→ RDS / Cloud SQL / Azure DB for PostgreSQL"]
-      AF["Airflow 3.3.1 LocalExecutor<br/>→ MWAA / Cloud Composer / Data Factory"]
+      AF["Airflow 3.3.1 LocalExecutor<br/>→ MWAA / Cloud Composer / Fabric Airflow job"]
       MLF["MLflow 3.16.1<br/>→ SageMaker with MLflow / Vertex AI / Azure ML"]
       FEAST["Feast 0.66.0<br/>→ SageMaker FS / Vertex AI FS / Azure ML FS"]
     end
@@ -367,7 +405,7 @@ flowchart TB
 | Object storage | Raw JSON, clean and feature Parquet, MLflow artifacts, DVC remote | MinIO-compatible `pgsty/silo` (buckets `raw`, `clean`, `features`, `mlflow`, `dvc`) | Amazon S3 | Cloud Storage | Blob Storage |
 | Data versioning | Snapshot of raw and clean layers; data version = DVC hash | DVC 3.67.1 + dvc-s3 3.3.0, remote on MinIO | S3 remote | GCS remote | Azure Blob remote |
 | Database | Feast online store, MLflow backend, `predictions` table, Airflow metadata | PostgreSQL 16 | Amazon RDS | Cloud SQL | Azure Database for PostgreSQL |
-| Orchestrator | DAGs `guardian_ingest_daily` (tasks `validate_batch`, `clean_transform`), `score_batch_daily`, `monitor_daily`, `train_classifier` | Apache Airflow 3.3.1, LocalExecutor | Amazon MWAA | Cloud Composer | Azure Data Factory |
+| Orchestrator | DAGs `guardian_ingest_daily` (tasks `validate_batch`, `clean_transform`), `score_batch_daily`, `monitor_daily`, `train_classifier` | Apache Airflow 3.3.1, LocalExecutor | Amazon MWAA | Cloud Composer | Apache Airflow job in Microsoft Fabric (Data Factory's managed Airflow is closed to new instances, see 6.7) |
 | Tracking and registry | Runs, metrics, lineage tags; model `news-section-classifier` with aliases | MLflow 3.16.1 (PostgreSQL backend, MinIO artifacts) | SageMaker with MLflow | Vertex AI Experiments and Model Registry | Azure ML with MLflow |
 | Feature store | Feature views `contributor_stats`, `office_stats`; feature service `section_classifier_v1` | Feast 0.66.0 (offline: Parquet in MinIO; online: PostgreSQL) | SageMaker Feature Store | Vertex AI Feature Store | Azure ML managed feature store |
 | Model service | `classifier-api`: FastAPI, loads `@champion`, serves `POST /classify`, `/health`, `/ready`, `/metrics` | Container on Minikube | Amazon EKS | GKE | AKS |
@@ -393,7 +431,13 @@ Lab 1 runs nothing but CI. Lab 2 starts MinIO, PostgreSQL, Airflow, MLflow and F
 | Ingestion | ≤ 3 API calls/day steady state; backfill ≤ 400 calls/day | Rate-limit headroom (4, cost row) |
 | Storage | Raw ≤ 5 GB, clean Parquet ≤ 1 GB | Assumption: ~10 KB raw JSON per article incl. tags |
 
-**Batch versus online: both, for different consumers.** The editorial desk needs the suggestion while the editor is filing the article, so a nightly batch would arrive too late; that path is online. Analytics and monitoring need every article of the day scored with the same model version, with labels joined later, and do not care about seconds; that path is a daily batch. Both paths load the same `@champion` and the same Feast feature service, so they cannot diverge.
+**Batch versus online: online for the consumer, batch for monitoring.**
+- **Online.** The editorial desk needs the suggestion while the editor is filing the article, so a nightly batch would arrive too late. This is the only path an external consumer uses.
+- **Batch.** A daily batch serves the system itself, not a consumer. It is needed for three reasons:
+  - `classifier-api` only sees the articles the CMS sends. The batch scores every article of the day with one model version, so drift and quality metrics (6.6) cover all of them.
+  - The champion/challenger comparison (5.4) needs both models scored on the same window, which is a batch job by nature.
+  - Lab 4 emulates drift by replaying whole months (2026-07 → 2026-09). Batch-scoring the replayed days does this without pushing thousands of requests through the API.
+- Both paths load the same `@champion` and the same Feast feature service, so they cannot diverge.
 
 ### 6.4 Security
 
@@ -443,7 +487,130 @@ First draft; Lab 4 makes it real.
 
 ### 6.7 Cost
 
-To be completed: monthly cloud estimate for the managed column of 6.2, using the AWS, Google Cloud and Azure pricing calculators, with the volume assumptions of 6.3.
+**Course setup: $0 cloud spend.** Labs 1–5 run on a laptop (Docker Compose, Minikube) with a free Guardian developer key. The figures below answer a different question: what would it cost to run the managed column of 6.2 in a real cloud?
+
+**How the estimate was made.**
+- Each component of 6.2 was entered into the official calculator of each cloud on 2026-10-20: [AWS Pricing Calculator](https://calculator.aws/#/), [Google Cloud Pricing Calculator](https://cloud.google.com/products/calculator), [Azure Pricing Calculator](https://azure.microsoft.com/en-us/pricing/calculator/).
+- Sizing follows 6.3: ~250 articles/day, 1 req/s, raw ≤ 5 GB, one training run per week of ≤ 30 min on 4 vCPU, a daily drift job.
+- Saved estimates:
+  - AWS: [public estimate link](https://calculator.aws/#/estimate?id=96339b91c26160458899ac5e0dea97e5d9e6fd7c), valid for one year.
+  - Google Cloud: [estimate summary](https://cloud.google.com/products/calculator/estimate-preview/CiRlZjBiMjBiMi1jNjcyLTRlZTEtYTIxYS0wODlkNWQ5NWU1ZDkQAQ%3D%3D).
+  - Azure: sharing requires a login, so the calculator exports are committed: [`cost/azure-estimate.xlsx`](cost/azure-estimate.xlsx) (with managed Airflow) and [`cost/azure-estimate-adf.xlsx`](cost/azure-estimate-adf.xlsx) (Data Factory instead of Airflow).
+
+**Assumptions.**
+- Assumption: region Frankfurt (AWS eu-central-1, GCP europe-west3, Azure Germany West Central). It is close to the Guardian's European audience and is the same region in all three clouds.
+- Assumption: on-demand prices, 730 h/month, USD, before tax.
+- Assumption: no free tier, credits, committed-use discounts or support plan. One environment, no high availability.
+- Assumption: data transfer is negligible at this volume and is left out, except for load balancer processing.
+- Calculator limitations:
+  - The Azure Monitor block reset its region to East US every time it reloaded, so that one line ($1.26) uses East US prices.
+  - The GKE line does not apply the GKE free-tier credit for one zonal cluster.
+- Assumption: managed Airflow on Azure is an Apache Airflow job in Microsoft Fabric.
+  - Data Factory's Workflow Orchestration Manager, the earlier managed Airflow, accepts no new instances since 2026-01-01 ([Microsoft docs](https://learn.microsoft.com/azure/data-factory/airflow-pricing)).
+  - A small custom pool (always on, needed for a 24/7 scheduler) uses 5 capacity units (CU), and Microsoft names F8 as the minimum capacity for it ([Airflow compute in Fabric](https://learn.microsoft.com/fabric/data-factory/apache-airflow-compute), [pricing](https://learn.microsoft.com/fabric/data-factory/pricing-apache-airflow-job)). The calculator prices Fabric as the whole F8 capacity.
+
+**Monthly estimate per component (USD).**
+
+| Component (6.2) | AWS | Google Cloud | Azure |
+|---|---|---|---|
+| Object storage, 20 GB + requests | S3: 0.85 | Cloud Storage: 0.75 | Blob Storage (Hot, LRS): 0.81 |
+| PostgreSQL, smallest burstable instance, 20 GB | RDS db.t4g.small, Single-AZ: 29.75 | Cloud SQL db-g1-small: 34.74 | Flexible Server B1ms, 32 GiB minimum disk: 18.91 |
+| Orchestrator, always on | MWAA, Small environment: **357.80** | Managed Service for Apache Airflow Gen 3 (formerly Cloud Composer), Small: **406.95** | Microsoft Fabric F8 capacity for an Apache Airflow job, small custom pool: **1,284.80** |
+| Tracking and registry | SageMaker managed MLflow, small tracking server 24/7: **638.51** | No managed MLflow: MLflow runs on the GKE nodes; Vertex AI Model Registry has no separate charge: 0 | MLflow tracking is built into the Azure ML workspace: 0 |
+| Feature store | SageMaker Feature Store, on-demand (10k writes, 100k reads): 0.60 | Vertex AI Feature Store (listed as "Agent Platform" in the calculator), 1 online serving node 24/7: **255.50** | Azure ML managed feature store; online store Azure Cache for Redis C0: 16.06 |
+| Training and drift jobs | SageMaker Training 4 × 0.5 h ml.m5.xlarge + Processing 30 × 0.25 h ml.m5.large: 3.85 | Vertex AI Training 4 × 0.5 h n1-standard-4: 0.56 (drift job runs on GKE) | Azure ML compute D4s v3, 10 h: 2.30 |
+| Kubernetes: control plane + 2 nodes (2 vCPU, 8 GB) + disks | EKS 73.00 + 2 × t3.large 145.87: 218.87 | GKE zonal cluster + 2 × e2-standard-2: 206.25 | AKS Standard tier + 2 × D2s v5: 245.70 |
+| Container registry, 10 GB | ECR: 1.00 | Artifact Registry: 0.95 | ACR Basic: 5.00 |
+| Metrics, logs, alerts | CloudWatch: 19.17 | Cloud Logging + Monitoring: 0.05 | Azure Monitor: 1.26 |
+| Load balancer in front of `classifier-api` | ALB: 19.94 | Cloud Load Balancing, regional: 40.18 | Load Balancer Standard: 18.26 |
+| **Total per month** | **1,290.34** | **945.93** | **1,593.09** |
+| Total per year | 15,484 | 11,351 | 19,117 |
+
+Azure without Airflow: replacing the Fabric line with Data Factory pipelines, billed per activity run ($3.55), gives **$311.84/month** ([`cost/azure-estimate-adf.png`](cost/azure-estimate-adf.png)). It is not like-for-like: every Airflow DAG would be rewritten as a Data Factory pipeline.
+
+**What the numbers say.**
+- **The model itself is almost free.**
+  - Training and drift jobs cost under $5/month in every cloud, and storage is under $1.
+  - This matches the guiding principle: a simple model with a cheap, reproducible rebuild.
+- **The bill comes from always-on managed control planes.**
+  - Three components that are idle almost all day account for 70–81% of every total:
+    - managed Airflow: $358–407 on AWS and Google Cloud, $1,285 on Azure;
+    - the managed MLflow server on AWS: $639;
+    - the online feature store node on GCP: $256.
+  - Our DAGs run for minutes per day, and the model is called about 250 times a day.
+- **Azure is the most expensive like-for-like, and the cheapest without Airflow.**
+  - Managed Airflow on Azure only runs inside a Fabric capacity, sold in fixed sizes. Airflow needs 5 CU, so the smallest fitting size is F8, and 3 of its 8 CU are paid for but unused.
+  - Everything else on Azure is cheap: MLflow tracking is free inside the Azure ML workspace, and the feature store's online store is a $16 Redis cache.
+  - Switching to Data Factory brings Azure to $312, but only by giving up Airflow.
+- **Kubernetes is the floor.**
+  - The cluster with two small nodes costs $206–246 in every cloud.
+  - The control-plane fee ($73 on EKS, GKE and AKS Standard) is a large part of that floor.
+
+**Cheaper variant: managed basics, self-hosted MLOps tools.**
+- This variant runs Airflow, MLflow and Feast on the Kubernetes cluster, as they already run locally. Only object storage, PostgreSQL, the registry and the cluster stay managed, and one more node is added for the extra pods.
+- Derived from the calculator line items above:
+  - AWS: 1,290 − 358 (MWAA) − 639 (MLflow) − 1 (Feature Store) + 73 (third t3.large) ≈ **$366/month**.
+  - Google Cloud: 946 − 407 (Airflow) − 256 (Feature Store) + 67 (third e2-standard-2) ≈ **$350/month**.
+  - Azure: 1,593 − 1,285 (Fabric) − 16 (Redis) + 86 (third D2s v5) ≈ **$378/month**.
+- With this variant all three clouds cost about the same, ~$350–380/month.
+- Price of the variant: we operate Airflow and MLflow ourselves, including upgrades, backups of their PostgreSQL schemas, and on-call.
+
+**Decision (Assumption, revisited in Lab 4).** If the system leaves the laptop, the self-hosted variant on any cloud is the default at this scale: ~$350–380/month, against $946–1,593/month for the fully managed setups. Azure with Data Factory ($312) is cheaper still, but it replaces Airflow and would mean rewriting the pipelines.
+- Managed Airflow pays off once there are many DAGs or several teams.
+- Managed MLflow and an online feature store node pay off once traffic is far above ~250 requests/day.
+- A first step down in cost is spot or preemptible nodes for the batch workloads, together with the GKE free-tier credit.
+
+**Calculator screenshots and what each line is for.** Each screenshot is followed by its calculator lines: the plan entered, the job it does in this system (components of 6.2), and why that plan was chosen. Line names (`mlops-…`) are the custom names typed into the calculators.
+
+**AWS Pricing Calculator: $1,290.34/month** ([public estimate](https://calculator.aws/#/estimate?id=96339b91c26160458899ac5e0dea97e5d9e6fd7c))
+
+![AWS Pricing Calculator estimate](cost/aws-estimate.png)
+
+| Calculator line | Plan entered | What it does in our system | Why this plan | USD/month |
+|---|---|---|---|---|
+| Amazon RDS for PostgreSQL, `mlops-postgres` | db.t4g.small, Single-AZ, 20 GB general-purpose SSD | One database for Airflow metadata, the MLflow backend, the Feast online store and the `predictions` table | Smallest burstable class: the load is a few hundred writes a day. Single-AZ because high availability is out of scope (assumptions above) | 29.75 |
+| Amazon S3, `mlops-lake` | S3 Standard, 20 GB, PUT and GET requests | Raw JSON, clean and feature Parquet, MLflow artifacts, DVC remote | Standard class, because training and drift jobs read the data every day. 20 GB covers the 5 GB raw ceiling plus derived layers and artifacts | 0.85 |
+| Amazon MWAA, `mlops-airflow` | Small environment, minimum 1 worker, 730 h | Runs the DAGs `guardian_ingest_daily`, `score_batch_daily`, `monitor_daily`, `train_classifier` | Smallest environment class. Four DAGs that run for minutes a day need no more. The environment cannot be stopped, so it is billed 24/7 | 357.80 |
+| Amazon EKS, `mlops-eks` | 1 cluster, standard support | Kubernetes control plane for `classifier-api` and monitoring (Lab 4) | One cluster for one environment | 73.00 |
+| Amazon EC2, `mlops-eks-nodes` | 2 × t3.large (2 vCPU, 8 GB), on-demand, Linux | Worker nodes of the EKS cluster | 8 GB per node covers the local 4 GB Minikube budget with headroom. Two nodes, so one node restart does not stop serving | 145.87 |
+| Amazon ECR, `mlops-images` | 10 GB stored | Images of `classifier-api` tagged with the commit | Billed per GB, and 10 GB keeps the recent image history | 1.00 |
+| Amazon CloudWatch, `mlops-observability` | Metrics, log ingestion, alarms | Latency, throughput and freshness metrics and alerts (Prometheus and Grafana locally) | Pay per use, no fixed fee | 19.17 |
+| Amazon SageMaker, `mlops-sagemaker` | Managed MLflow, small tracking server 24/7 (638.51); Training 4 × 0.5 h ml.m5.xlarge and Processing 30 × 0.25 h ml.m5.large (3.85); Feature Store on-demand, 10k writes and 100k reads (0.60) | Experiment tracking and the model registry; weekly training; the daily drift job; the feature store for `contributor_stats` and `office_stats` | Smallest MLflow server size. Training on 4 vCPU for ≤ 30 min, per 6.3; drift on 2 vCPU. Feature Store on-demand, because ~250 reads a day are far too few for provisioned capacity | 642.96 |
+| Elastic Load Balancing, `mlops-ingress` | 1 Application Load Balancer | HTTPS entry point to `classifier-api` (`POST /v1/classify`, health checks) | ALB, because the API is HTTP with path versioning | 19.94 |
+
+**Google Cloud Pricing Calculator: $945.93/month** ([estimate summary](https://cloud.google.com/products/calculator/estimate-preview/CiRlZjBiMjBiMi1jNjcyLTRlZTEtYTIxYS0wODlkNWQ5NWU1ZDkQAQ%3D%3D); the calculator with the share dialog: [`cost/gcp-calculator.png`](cost/gcp-calculator.png))
+
+![Google Cloud Pricing Calculator estimate](cost/gcp-estimate.png)
+
+| Calculator line | Plan entered | What it does in our system | Why this plan | USD/month |
+|---|---|---|---|---|
+| Managed Airflow Gen 3 (formerly Cloud Composer) | Small environment; 1 scheduler, 1 worker, 1 web server, 1 triggerer, 1 DAG processor; 730 h | Runs the four Airflow DAGs | Smallest environment size, not highly resilient | 406.95 |
+| Feature Store (listed under "Agent Platform") | Optimized online serving, 1 node, 730 h | Serves `contributor_stats` and `office_stats` to `classifier-api` at request time | Online serving needs at least one node running 24/7. The offline store lives in Cloud Storage, already counted | 255.50 |
+| GKE (Kubernetes Engine) | 1 zonal cluster; 2 × e2-standard-2 (2 vCPU, 8 GB); 30 GB balanced boot disk; regular provisioning | Runs `classifier-api`, monitoring, the MLflow server (no managed MLflow on Google Cloud) and the daily drift job | Zonal cluster, because multi-zone HA is out of scope. Node size matches the other clouds | 206.25 |
+| PostgreSQL (Cloud SQL) | Enterprise edition, db-g1-small (1 vCPU, 1.7 GB), 20 GB SSD, no HA | Same shared database as on AWS | Smallest shared-core instance that fits four light workloads | 34.74 |
+| Cloud Load Balancing | Regional, 1 forwarding rule, 1 proxy instance, ~1 GB processed | HTTPS entry point to `classifier-api` | Regional, because all users and services are in one region | 40.18 |
+| Artifact Registry | 10 GB, Europe | Images of `classifier-api` | Same image history as on AWS | 0.95 |
+| Cloud Storage | Standard, regional europe-west3, 20 GB, 0.2 million Class B operations | Data lake, MLflow artifacts, DVC remote, Feature Store offline data | Standard class for data read daily; regional, next to the compute | 0.75 |
+| Training (Vertex AI) | n1-standard-4 (4 vCPU, 15 GB), 1 node, 4 jobs × 0.5 h | Weekly training of the classifier | 4 vCPU and ≤ 30 min per run, per 6.3 | 0.56 |
+| Cloud Logging and Cloud Monitoring | 5 GB of logs; 50 metrics on 5 resources | Logs, metrics and alerts | Within the free allotments, so the charge is near zero | 0.05 |
+
+**Azure Pricing Calculator: $1,593.09/month** (full page; exported as [`cost/azure-estimate.xlsx`](cost/azure-estimate.xlsx))
+
+![Azure Pricing Calculator estimate](cost/azure-estimate.png)
+
+| Calculator line | Plan entered | What it does in our system | Why this plan | USD/month |
+|---|---|---|---|---|
+| Microsoft Fabric, `mlops-airflow` | F8 capacity (8 CU), pay-as-you-go, 730 h | Hosts the Apache Airflow job (small custom pool) that runs the four DAGs | The only managed Airflow on Azure today. A small always-on pool uses 5 CU, and Microsoft names F8 as its minimum capacity, so F4 (4 CU) would be too small | 1,284.80 |
+| Azure Database for PostgreSQL, `mlops-postgres` | Flexible Server, Burstable B1ms (1 vCore), 32 GiB Premium SSD, LRS | Same shared database as on AWS | Smallest burstable size. 32 GiB is the smallest disk the service offers | 18.91 |
+| Storage Accounts, `mlops-lake` | Block blob, General Purpose v2, Hot tier, LRS, 20 GB, about 270k operations | Data lake, MLflow artifacts, DVC remote, offline feature store | Hot tier, because the data is read daily; LRS, because the data can be re-collected from the Guardian API | 0.81 |
+| Azure Kubernetes Service, `mlops-aks` | Standard tier (with SLA), 1 cluster; 2 × D2s v5 (2 vCPU, 8 GB); 2 × E4 managed disks | Runs `classifier-api` and monitoring (Lab 4) | Standard tier, so the control plane has an uptime SLA, as on EKS and GKE. Node size matches the other clouds | 245.70 |
+| Azure Machine Learning, `mlops-aml-jobs` | D4s v3 (4 vCPU, 16 GB), 10 h pay-as-you-go | Weekly training (4 × 0.5 h) and the daily drift job (30 × 0.25 h); the workspace also provides MLflow tracking and the model registry at no charge | Compute is billed only while jobs run. 9.5 h of jobs rounded up to 10 h | 2.30 |
+| Azure Cache for Redis, `mlops-feature-online` | Basic tier, C0 (250 MB), 730 h | Online store of the Azure ML managed feature store | Smallest cache. Basic has no SLA, which is acceptable because features can be recomputed from the offline store | 16.06 |
+| Azure Container Registry, `mlops-images` | Basic tier, 10 GB included, no extra egress | Images of `classifier-api` | Lowest tier. It already includes the 10 GB we need | 5.00 |
+| Load Balancer, `mlops-ingress` | Standard tier, 1 rule, 1 GB processed | Entry point to `classifier-api` on AKS | Standard tier is required for AKS clusters | 18.26 |
+| Azure Monitor | 0.17 GB of logs per day, metric alerts on 10 resources (East US prices, see assumptions) | Logs, metrics and alerts | Pay per use, matching our low volumes | 1.26 |
+
+Without Airflow, Azure costs $311.84/month: the Fabric line is replaced by Data Factory pipelines billed per activity run ($3.55). Screenshot: [`cost/azure-estimate-adf.png`](cost/azure-estimate-adf.png); export: [`cost/azure-estimate-adf.xlsx`](cost/azure-estimate-adf.xlsx).
 
 ### 6.8 Integration points
 
@@ -451,8 +618,9 @@ To be completed: monthly cloud estimate for the managed column of 6.2, using the
 |---|---|---|---|
 | Guardian Content API | Upstream (data and labels) | Guardian News & Media | REST/JSON over HTTPS; fields and tag types as in the public content model; developer key, non-commercial terms. Rate limit: Assumption 500 calls/day and 1 call/s until measured from response headers. Schema changes are not announced to us, so `validate_batch` checks the schema on every batch (6.9). |
 | Editorial desk / CMS (`cms-client`) | Downstream (online) | Project (emulated) | `POST /classify`, JSON in `{headline, standfirst, body_text, contributor_ids, production_office, published_at}`, JSON out `{section, confidence, top3, model_version, fallback_used}`. p95 ≤ 300 ms. Unknown fields ignored. On errors the client keeps the editor's manual choice. The API is versioned by path (`/v1/`). |
-| Newsroom analytics | Downstream (batch) | Project | Table `predictions` in PostgreSQL, one row per article per model version, complete for day D by 06:00 UTC on D+1. Columns are additive only; renames need a new table version. |
 | On-call ML engineer | Downstream (alerts) | Repository owner | E-mail from Grafana with the rule name, current value, threshold and a link to the dashboard or Evidently report. |
+
+**Internal contract: the `predictions` table.** No external party reads it, but `monitor_daily` and the champion/challenger comparison depend on it. It has one row per article per model version and is complete for day D by 06:00 UTC on D+1. Columns are only added, never renamed; a rename needs a new table version.
 
 ### 6.9 Risks and uncertainties
 
